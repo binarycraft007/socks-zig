@@ -67,8 +67,7 @@ pub fn acceptLoop(self: *Server) !void {
 pub fn clientHandler(stream: net.Stream, wg: *WaitGroup) void {
     defer wg.finish();
 
-    var metadata: MetaData = undefined;
-    handshakeHandler(stream, &metadata);
+    var metadata = handshakeHandler(stream);
     log.info("received socks cmd: {s}", .{@tagName(metadata.command)});
 
     switch (metadata.command) {
@@ -100,7 +99,7 @@ pub fn connect(stream: net.Stream) void {
 /// +----+----------+----------+  +----+--------+
 /// | 1  |    1     | 1 to 255 |  | 1  |   1    |
 /// +----+----------+----------+  +----+--------+
-pub fn handshakeHandler(stream: net.Stream, metadata: *MetaData) void {
+pub fn handshakeHandler(stream: net.Stream) MetaData {
     var version = stream.reader().readBoundedBytes(1) catch |err| {
         @panic(@errorName(err));
     };
@@ -126,7 +125,7 @@ pub fn handshakeHandler(stream: net.Stream, metadata: *MetaData) void {
         @panic(@errorName(err));
     };
 
-    metadata.* = MetaData{
+    return MetaData{
         .command = @intToEnum(Command, cmd_buf.slice()[1]),
         .address = readAddress(stream),
     };
