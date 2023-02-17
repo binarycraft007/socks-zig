@@ -31,17 +31,21 @@ pub const MetaData = struct {
     address: net.Address,
 };
 
-pub fn init(allocator: mem.Allocator) !Server {
-    const localhost = try net.Address.parseIp("127.0.0.1", 1080);
+pub const InitOptions = struct {
+    address: []const u8,
+    port: u16,
+};
+
+pub fn init(allocator: mem.Allocator, opts: InitOptions) !Server {
+    const addr = try net.Address.parseIp(opts.address, opts.port);
     var server = Server{
         .io = try IO.init(32, 0),
-        .stream_server = net.StreamServer.init(.{
-            .kernel_backlog = 32,
-            .reuse_address = true,
-        }),
+        .stream_server = net.StreamServer.init(
+            .{ .kernel_backlog = 32, .reuse_address = true },
+        ),
     };
     try server.thread_pool.init(allocator);
-    try server.stream_server.listen(localhost);
+    try server.stream_server.listen(addr);
 
     return server;
 }
