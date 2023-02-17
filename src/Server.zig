@@ -71,12 +71,18 @@ pub fn acceptLoop(self: *Server) !void {
 pub fn clientHandler(stream: net.Stream, wg: *WaitGroup) void {
     defer wg.finish();
 
-    var metadata = handshakeHandler(stream);
+    var metadata = handshakeHandler(stream) catch |err| {
+        log.err("handshake error: {s}", .{@errorName(err)});
+        return;
+    };
     log.info("received socks cmd: {s}", .{@tagName(metadata.command)});
 
     switch (metadata.command) {
         .connect => {
-            connect(stream);
+            connect(stream) catch |err| {
+                log.err("connect error: {s}", .{@errorName(err)});
+                return;
+            };
         },
         .associate => {},
         .bind => {
@@ -91,11 +97,9 @@ pub fn clientHandler(stream: net.Stream, wg: *WaitGroup) void {
 /// +----+-----+-------+------+----------+----------+
 /// | 1  |  1  | X'00' |  1   | Variable |    2     |
 /// +----+-----+-------+------+----------+----------+
-pub fn connect(stream: net.Stream) void {
+pub fn connect(stream: net.Stream) !void {
     var buf = [_]u8{ 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
-    _ = stream.writer().write(&buf) catch |err| {
-        @panic(@errorName(err));
-    };
+    _ = try stream.writer().write(&buf);
 }
 
 /// +----+----------+----------+  +----+--------+
@@ -103,75 +107,59 @@ pub fn connect(stream: net.Stream) void {
 /// +----+----------+----------+  +----+--------+
 /// | 1  |    1     | 1 to 255 |  | 1  |   1    |
 /// +----+----------+----------+  +----+--------+
-pub fn handshakeHandler(stream: net.Stream) MetaData {
-    var version = stream.reader().readBoundedBytes(1) catch |err| {
-        @panic(@errorName(err));
-    };
+pub fn handshakeHandler(stream: net.Stream) !MetaData {
+    var version = try stream.reader().readBoundedBytes(1);
 
     if (version.slice()[0] != 5) {
-        @panic("only socks version 5 is supported");
+        return error.SocksVersionUnsupported;
     }
 
-    var nmethods = stream.reader().readBoundedBytes(1) catch |err| {
-        @panic(@errorName(err));
-    };
+    var nmethods = try stream.reader().readBoundedBytes(1);
 
     var methods: [255]u8 = [_]u8{0} ** 255;
-    _ = stream.reader().read(methods[0..nmethods.slice()[0]]) catch |err| {
-        @panic(@errorName(err));
-    };
+    _ = try stream.reader().read(methods[0..nmethods.slice()[0]]);
 
-    _ = stream.writer().write(&[_]u8{ 5, 0x0 }) catch |err| {
-        @panic(@errorName(err));
-    };
+    _ = try stream.writer().write(&[_]u8{ 5, 0x0 });
 
-    var cmd_buf = stream.reader().readBoundedBytes(3) catch |err| {
-        @panic(@errorName(err));
-    };
+    var cmd_buf = try stream.reader().readBoundedBytes(3);
 
     return MetaData{
         .command = @intToEnum(Command, cmd_buf.slice()[1]),
-        .address = readAddress(stream),
+        .address = try readAddress(stream),
     };
 }
 
-pub fn readAddress(stream: net.Stream) net.Address {
+pub fn readAddress(stream: net.Stream) !net.Address {
     var port: u16 = undefined;
     var addr: []u8 = undefined;
 
-    var addr_type = stream.reader().readBoundedBytes(1) catch |err| {
-        @panic(@errorName(err));
-    };
+    var addr_type = try stream.reader().readBoundedBytes(1);
 
     switch (@intToEnum(AddressType, addr_type.slice()[0])) {
         .ipv4_addr => {
             var buf: [15]u8 = undefined;
 
-            var addr_str = stream.reader().readBoundedBytes(4) catch |err| {
-                @panic(@errorName(err));
-            };
-            var port_str = stream.reader().readBoundedBytes(2) catch |err| {
-                @panic(@errorName(err));
-            };
+            var addr_str = try stream.reader().readBoundedBytes(4);
+            var port_str = try stream.reader().readBoundedBytes(2);
 
             var addr_slice = addr_str.slice();
             var port_slice = port_str.slice();
 
-            addr = fmt.bufPrint(
+            addr = try fmt.bufPrint(
                 &buf,
                 "{}.{}.{}.{}",
                 .{ addr_slice[0], addr_slice[1], addr_slice[2], addr_slice[3] },
-            ) catch |err| @panic(@errorName(err));
+            );
 
             port = @as(u16, port_slice[0]) << 8 | @as(u16, port_slice[1]);
             log.info("destination address: {s}:{d}", .{ addr, port });
         },
         .domain_name => {
-            @panic("domain name unimplemented");
+            return error.DomainNameUnimplemented;
         },
         .ipv6_addr => {
-            @panic("ipv6 address unimplemented");
+            return error.Ipv6AddressUnimplemented;
         },
     }
-    return net.Address.parseIp(addr, port) catch |err| @panic(@errorName(err));
+    return try net.Address.parseIp(addr, port);
 }
