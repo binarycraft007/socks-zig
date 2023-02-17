@@ -1,7 +1,13 @@
 const std = @import("std");
-const IO = @import("io").IO;
+const Server = @import("Server.zig");
 
 pub fn main() !void {
-    var io = try IO.init(32, 0);
-    defer io.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var server = try Server.init(allocator);
+    defer server.deinit();
+
+    try server.acceptLoop();
 }
