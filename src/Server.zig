@@ -10,7 +10,6 @@ const fmt = std.fmt;
 
 const Server = @This();
 
-io: IO,
 stream_server: net.StreamServer,
 thread_pool: ThreadPool = undefined,
 
@@ -39,7 +38,6 @@ pub const InitOptions = struct {
 pub fn init(allocator: mem.Allocator, opts: InitOptions) !Server {
     const addr = try net.Address.parseIp(opts.address, opts.port);
     var server = Server{
-        .io = try IO.init(32, 0),
         .stream_server = net.StreamServer.init(
             .{ .kernel_backlog = 32, .reuse_address = true },
         ),
@@ -51,7 +49,6 @@ pub fn init(allocator: mem.Allocator, opts: InitOptions) !Server {
 }
 
 pub fn deinit(self: *Server) void {
-    self.io.deinit();
     self.thread_pool.deinit();
     self.stream_server.deinit();
 }
@@ -72,34 +69,187 @@ pub fn clientHandler(stream: net.Stream, wg: *WaitGroup) void {
     defer wg.finish();
 
     var metadata = handshakeHandler(stream) catch |err| {
-        log.err("handshake error: {s}", .{@errorName(err)});
+        log.scoped(.handshake).err("{s}", .{@errorName(err)});
         return;
     };
     log.info("received socks cmd: {s}", .{@tagName(metadata.command)});
 
     switch (metadata.command) {
         .connect => {
-            connect(stream) catch |err| {
-                log.err("connect error: {s}", .{@errorName(err)});
+            log.info("try to connect to addr: {any}", .{metadata.address});
+
+            var remote = connectHandler(stream, metadata) catch |err| {
+                log.scoped(.connect).err("{s}", .{@errorName(err)});
+                return;
+            };
+            defer remote.close();
+
+            log.info("addr: {any} connect success", .{metadata.address});
+            var event_loop = EventLoop.init(stream, remote) catch |err| {
+                log.scoped(.connect).err("{s}", .{@errorName(err)});
+                return;
+            };
+            event_loop.copyLoop() catch |err| {
+                log.scoped(.connect).err("{s}", .{@errorName(err)});
                 return;
             };
         },
         .associate => {},
         .bind => {
-            log.err("bind command is not supported", .{});
+            log.scoped(.bind).err("BindCommandUnsupported", .{});
             return;
         },
     }
 }
+
+pub const EventLoop = struct {
+    const Self = @This();
+    io: IO,
+    client: net.Stream,
+    remote: net.Stream,
+    read_n: usize = 0,
+    write_n: usize = 0,
+    buffer: [1024]u8 = [_]u8{0} ** 1024,
+    client_read_done: bool = false,
+    remote_read_done: bool = false,
+    client_read_once_done: bool = false,
+    remote_read_once_done: bool = false,
+
+    pub fn init(client: net.Stream, remote: net.Stream) !Self {
+        return Self{
+            .client = client,
+            .remote = remote,
+            .io = try IO.init(32, 0),
+        };
+    }
+
+    pub fn copyLoop(self: *Self) !void {
+        // Start receiving on the client
+        while (true) {
+            var client_read_completion: IO.Completion = undefined;
+            self.io.read(
+                *EventLoop,
+                self,
+                on_read_client,
+                &client_read_completion,
+                self.client.handle,
+                &self.buffer,
+                0,
+            );
+
+            while (!self.client_read_once_done) try self.io.tick();
+            self.client_read_once_done = false;
+
+            if (self.client_read_done) {
+                break;
+            }
+        }
+
+        while (true) {
+            var remote_read_completion: IO.Completion = undefined;
+            self.io.read(
+                *EventLoop,
+                self,
+                on_read_remote,
+                &remote_read_completion,
+                self.remote.handle,
+                &self.buffer,
+                0,
+            );
+
+            while (!self.remote_read_once_done) try self.io.tick();
+            self.remote_read_once_done = false;
+
+            if (self.remote_read_done) {
+                break;
+            }
+        }
+    }
+
+    fn on_read_client(
+        self: *EventLoop,
+        completion: *IO.Completion,
+        result: IO.ReadError!usize,
+    ) void {
+        self.read_n = result catch |err| @panic(@errorName(err));
+
+        self.io.write(
+            *EventLoop,
+            self,
+            on_write_remote,
+            completion,
+            self.remote.handle,
+            self.buffer[0..self.read_n],
+            0,
+        );
+    }
+
+    fn on_write_remote(
+        self: *EventLoop,
+        completion: *IO.Completion,
+        result: IO.WriteError!usize,
+    ) void {
+        _ = completion;
+        self.write_n = result catch |err| @panic(@errorName(err));
+        self.client_read_once_done = true;
+
+        if (self.write_n < self.buffer.len) {
+            self.client_read_done = true;
+        }
+    }
+
+    fn on_read_remote(
+        self: *EventLoop,
+        completion: *IO.Completion,
+        result: IO.ReadError!usize,
+    ) void {
+        self.read_n = result catch |err| @panic(@errorName(err));
+        if (self.read_n < self.buffer.len) {
+            self.remote_read_done = true;
+        }
+
+        self.io.write(
+            *EventLoop,
+            self,
+            on_write_client,
+            completion,
+            self.client.handle,
+            self.buffer[0..self.read_n],
+            0,
+        );
+    }
+
+    fn on_write_client(
+        self: *EventLoop,
+        completion: *IO.Completion,
+        result: IO.WriteError!usize,
+    ) void {
+        _ = completion;
+        self.write_n = result catch |err| @panic(@errorName(err));
+        self.remote_read_once_done = true;
+
+        if (self.write_n < self.buffer.len) {
+            self.remote_read_done = true;
+        }
+    }
+};
 
 /// +----+-----+-------+------+----------+----------+
 /// |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
 /// +----+-----+-------+------+----------+----------+
 /// | 1  |  1  | X'00' |  1   | Variable |    2     |
 /// +----+-----+-------+------+----------+----------+
-pub fn connect(stream: net.Stream) !void {
-    var buf = [_]u8{ 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
-    _ = try stream.writer().write(&buf);
+pub fn connectHandler(stream: net.Stream, metadata: MetaData) !net.Stream {
+    var remote = net.tcpConnectToAddress(metadata.address) catch |err| {
+        var fail = [_]u8{ 5, 4, 0, 1, 0, 0, 0, 0, 0, 0 };
+        _ = try stream.writer().write(&fail);
+        return err;
+    };
+
+    var success = [_]u8{ 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
+    _ = try stream.writer().write(&success);
+
+    return remote;
 }
 
 /// +----+----------+----------+  +----+--------+
@@ -142,17 +292,16 @@ pub fn readAddress(stream: net.Stream) !net.Address {
             var addr_str = try stream.reader().readBoundedBytes(4);
             var port_str = try stream.reader().readBoundedBytes(2);
 
-            var addr_slice = addr_str.slice();
-            var port_slice = port_str.slice();
+            var addr_s = addr_str.slice();
+            var port_s = port_str.slice();
 
             addr = try fmt.bufPrint(
                 &buf,
                 "{}.{}.{}.{}",
-                .{ addr_slice[0], addr_slice[1], addr_slice[2], addr_slice[3] },
+                .{ addr_s[0], addr_s[1], addr_s[2], addr_s[3] },
             );
 
-            port = @as(u16, port_slice[0]) << 8 | @as(u16, port_slice[1]);
-            log.info("destination address: {s}:{d}", .{ addr, port });
+            port = @as(u16, port_s[0]) << 8 | @as(u16, port_s[1]);
         },
         .domain_name => {
             return error.DomainNameUnimplemented;
