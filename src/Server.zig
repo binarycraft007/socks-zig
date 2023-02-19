@@ -204,9 +204,6 @@ pub const EventLoop = struct {
         result: IO.ReadError!usize,
     ) void {
         self.read_n = result catch |err| @panic(@errorName(err));
-        if (self.read_n < self.buffer.len) {
-            self.remote_read_done = true;
-        }
 
         self.io.write(
             *EventLoop,
