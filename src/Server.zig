@@ -1,51 +1,22 @@
 const std = @import("std");
-const IO = @import("io").IO;
+const log = std.log;
+const fmt = std.fmt;
+const mem = std.mem;
+const net = std.net;
 const ThreadPool = @import("ThreadPool.zig");
 const WaitGroup = @import("WaitGroup.zig");
-const os = std.os;
-const mem = std.mem;
-const log = std.log;
-const net = std.net;
-const fmt = std.fmt;
-
 const Server = @This();
 
+thread_pool: *ThreadPool = undefined,
 stream_server: net.StreamServer,
-thread_pool: ThreadPool = undefined,
 
-pub const AddressType = enum(u8) {
-    ipv4_addr = 0x01,
-    domain_name = 0x03,
-    ipv6_addr = 0x04,
-};
+pub fn init(thread_pool: *ThreadPool) !Server {
+    var stream_server = net.StreamServer.init(.{});
 
-pub const Command = enum(u8) {
-    connect = 0x01,
-    bind = 0x02,
-    associate = 0x03,
-};
-
-pub const MetaData = struct {
-    command: Command,
-    address: net.Address,
-};
-
-pub const InitOptions = struct {
-    address: []const u8,
-    port: u16,
-};
-
-pub fn init(allocator: mem.Allocator, opts: InitOptions) !Server {
-    const addr = try net.Address.parseIp(opts.address, opts.port);
-    var server = Server{
-        .stream_server = net.StreamServer.init(
-            .{ .kernel_backlog = 32, .reuse_address = true },
-        ),
+    return Server{
+        .thread_pool = thread_pool,
+        .stream_server = stream_server,
     };
-    try server.thread_pool.init(allocator);
-    try server.stream_server.listen(addr);
-
-    return server;
 }
 
 pub fn deinit(self: *Server) void {
@@ -53,22 +24,33 @@ pub fn deinit(self: *Server) void {
     self.stream_server.deinit();
 }
 
-pub fn acceptLoop(self: *Server) !void {
-    while (true) {
-        var wg = WaitGroup{};
-        var conn = try self.stream_server.accept();
-        defer conn.stream.close();
+pub fn startServe(self: *Server, listen_ip: []const u8, port: u16) !void {
+    const listen_addr = try net.Address.parseIp(listen_ip, port);
+    try self.stream_server.listen(listen_addr);
 
-        wg.start();
-        try self.thread_pool.spawn(clientHandler, .{ conn.stream, &wg });
-        self.thread_pool.waitAndWork(&wg);
+    while (true) {
+        var wg: WaitGroup = .{};
+        defer self.thread_pool.waitAndWork(&wg);
+
+        for (self.thread_pool.threads) |_| {
+            wg.start();
+            try self.thread_pool.spawn(worker, .{ &self.stream_server, &wg });
+        }
     }
 }
 
-pub fn clientHandler(stream: net.Stream, wg: *WaitGroup) void {
+fn worker(server: *net.StreamServer, wg: *WaitGroup) void {
     defer wg.finish();
 
-    var metadata = handshakeHandler(stream) catch |err| {
+    var client = server.accept() catch |err| {
+        std.log.err("accept error: {s}", .{@errorName(err)});
+        return;
+    };
+    defer client.stream.close();
+
+    std.log.info("got client connection: {d}", .{client.stream.handle});
+
+    var metadata = handshakeHandler(client.stream) catch |err| {
         log.scoped(.handshake).err("{s}", .{@errorName(err)});
         return;
     };
@@ -78,21 +60,21 @@ pub fn clientHandler(stream: net.Stream, wg: *WaitGroup) void {
         .connect => {
             log.info("try to connect to addr: {any}", .{metadata.address});
 
-            var remote = connectHandler(stream, metadata) catch |err| {
+            var remote = connectHandler(client.stream, metadata) catch |err| {
                 log.scoped(.connect).err("{s}", .{@errorName(err)});
                 return;
             };
             defer remote.close();
 
             log.info("addr: {any} connect success", .{metadata.address});
-            var event_loop = EventLoop.init(stream, remote) catch |err| {
-                log.scoped(.connect).err("{s}", .{@errorName(err)});
-                return;
-            };
-            event_loop.copyLoop() catch |err| {
-                log.scoped(.connect).err("{s}", .{@errorName(err)});
-                return;
-            };
+            //var event_loop = EventLoop.init(stream, remote) catch |err| {
+            //    log.scoped(.connect).err("{s}", .{@errorName(err)});
+            //    return;
+            //};
+            //event_loop.copyLoop() catch |err| {
+            //    log.scoped(.connect).err("{s}", .{@errorName(err)});
+            //    return;
+            //};
         },
         .associate => {},
         .bind => {
@@ -101,115 +83,6 @@ pub fn clientHandler(stream: net.Stream, wg: *WaitGroup) void {
         },
     }
 }
-
-pub const EventLoop = struct {
-    const Self = @This();
-    io: IO,
-    client: net.Stream,
-    remote: net.Stream,
-    read_n: usize = 0,
-    write_n: usize = 0,
-    buffer: [1024]u8 = [_]u8{0} ** 1024,
-    client_read_done: bool = false,
-    remote_read_done: bool = false,
-    client_read_once_done: bool = false,
-    remote_read_once_done: bool = false,
-
-    pub fn init(client: net.Stream, remote: net.Stream) !Self {
-        return Self{
-            .client = client,
-            .remote = remote,
-            .io = try IO.init(32, 0),
-        };
-    }
-
-    pub fn copyLoop(self: *Self) !void {
-        // Start receiving on the client
-        while (true) {
-            var client_read_completion: IO.Completion = undefined;
-            self.io.read(
-                *EventLoop,
-                self,
-                on_read_client,
-                &client_read_completion,
-                self.client.handle,
-                &self.buffer,
-                0,
-            );
-
-            var remote_read_completion: IO.Completion = undefined;
-            self.io.read(
-                *EventLoop,
-                self,
-                on_read_remote,
-                &remote_read_completion,
-                self.remote.handle,
-                &self.buffer,
-                0,
-            );
-
-            while (!self.remote_read_once_done) try self.io.tick();
-            self.remote_read_once_done = false;
-        }
-    }
-
-    fn on_read_client(
-        self: *EventLoop,
-        completion: *IO.Completion,
-        result: IO.ReadError!usize,
-    ) void {
-        self.read_n = result catch |err| @panic(@errorName(err));
-
-        self.io.write(
-            *EventLoop,
-            self,
-            on_write_remote,
-            completion,
-            self.remote.handle,
-            self.buffer[0..self.read_n],
-            0,
-        );
-    }
-
-    fn on_write_remote(
-        self: *EventLoop,
-        completion: *IO.Completion,
-        result: IO.WriteError!usize,
-    ) void {
-        _ = completion;
-        self.write_n = result catch |err| @panic(@errorName(err));
-        self.client_read_once_done = true;
-    }
-
-    fn on_read_remote(
-        self: *EventLoop,
-        completion: *IO.Completion,
-        result: IO.ReadError!usize,
-    ) void {
-        self.read_n = result catch |err| @panic(@errorName(err));
-
-        self.io.write(
-            *EventLoop,
-            self,
-            on_write_client,
-            completion,
-            self.client.handle,
-            self.buffer[0..self.read_n],
-            0,
-        );
-    }
-
-    fn on_write_client(
-        self: *EventLoop,
-        completion: *IO.Completion,
-        result: IO.WriteError!usize,
-    ) void {
-        _ = completion;
-        self.write_n = result catch |err| @panic(@errorName(err));
-
-        self.remote_read_once_done = true;
-    }
-};
 
 /// +----+-----+-------+------+----------+----------+
 /// |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
@@ -250,6 +123,7 @@ pub fn handshakeHandler(stream: net.Stream) !MetaData {
 
     var cmd_buf = try stream.reader().readBoundedBytes(3);
 
+    log.info("handshake success, stream: {d}", .{stream.handle});
     return MetaData{
         .command = @intToEnum(Command, cmd_buf.slice()[1]),
         .address = try readAddress(stream),
@@ -289,3 +163,20 @@ pub fn readAddress(stream: net.Stream) !net.Address {
     }
     return try net.Address.parseIp(addr, port);
 }
+
+pub const AddressType = enum(u8) {
+    ipv4_addr = 0x01,
+    domain_name = 0x03,
+    ipv6_addr = 0x04,
+};
+
+pub const Command = enum(u8) {
+    connect = 0x01,
+    bind = 0x02,
+    associate = 0x03,
+};
+
+pub const MetaData = struct {
+    command: Command,
+    address: net.Address,
+};
