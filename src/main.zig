@@ -1,6 +1,7 @@
 const std = @import("std");
 const os = std.os;
 const net = std.net;
+const builtin = @import("builtin");
 const Server = @import("Server.zig");
 const ThreadPool = @import("ThreadPool.zig");
 
