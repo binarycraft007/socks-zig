@@ -1,8 +1,10 @@
 const std = @import("std");
+const os = std.os;
 const log = std.log;
 const fmt = std.fmt;
 const mem = std.mem;
 const net = std.net;
+const meta = std.meta;
 const ThreadPool = @import("ThreadPool.zig");
 const WaitGroup = @import("WaitGroup.zig");
 const Server = @This();
@@ -67,20 +69,42 @@ fn worker(server: *net.StreamServer, wg: *WaitGroup) void {
             defer remote.close();
 
             log.info("addr: {any} connect success", .{metadata.address});
-            //var event_loop = EventLoop.init(stream, remote) catch |err| {
-            //    log.scoped(.connect).err("{s}", .{@errorName(err)});
-            //    return;
-            //};
-            //event_loop.copyLoop() catch |err| {
-            //    log.scoped(.connect).err("{s}", .{@errorName(err)});
-            //    return;
-            //};
+
+            copyLoop(client.stream, remote) catch |err| {
+                log.scoped(.connect).err("{s}", .{@errorName(err)});
+                return;
+            };
         },
         .associate => {},
         .bind => {
             log.scoped(.bind).err("BindCommandUnsupported", .{});
             return;
         },
+    }
+}
+
+pub fn copyLoop(strm1: net.Stream, strm2: net.Stream) !void {
+    var fds = [_]os.pollfd{
+        .{ .fd = strm1.handle, .events = os.POLL.IN, .revents = 0 },
+        .{ .fd = strm2.handle, .events = os.POLL.IN, .revents = 0 },
+    };
+
+    while (true) {
+        _ = try os.poll(&fds, 60 * 15 * 1000);
+
+        var in = if (fds[0].revents & os.POLL.IN > 0) strm1 else strm2;
+        var out = if (std.meta.eql(in, strm2)) strm1 else strm2;
+        var buf: [1024]u8 = undefined;
+
+        var read_n = try in.reader().read(&buf);
+        if (read_n < 0) return;
+
+        var sent_n: usize = 0;
+        while (sent_n < read_n) {
+            var m = try out.writer().write(buf[sent_n..read_n]);
+            if (m < 0) return;
+            sent_n += m;
+        }
     }
 }
 
