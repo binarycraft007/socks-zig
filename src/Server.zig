@@ -8,6 +8,7 @@ const net = std.net;
 const meta = std.meta;
 const ThreadPool = @import("ThreadPool.zig");
 const WaitGroup = @import("WaitGroup.zig");
+const windows = std.os.windows;
 const Server = @This();
 
 thread_pool: *ThreadPool = undefined,
@@ -85,7 +86,11 @@ fn worker(server: *net.StreamServer, wg: *WaitGroup) void {
 }
 
 pub fn copyLoop(strm1: net.Stream, strm2: net.Stream) !void {
-    const event = os.POLL.IN;
+    const event = if (builtin.os.tag != .windows) blk: {
+        break :blk os.POLL.IN;
+    } else blk: {
+        break :blk os.POLL.RDNORM & os.POLL.RDBAND;
+    };
 
     var fds = [_]os.pollfd{
         .{ .fd = strm1.handle, .events = event, .revents = 0 },
@@ -93,7 +98,11 @@ pub fn copyLoop(strm1: net.Stream, strm2: net.Stream) !void {
     };
 
     while (true) {
-        _ = try os.poll(&fds, 60 * 15 * 1000);
+        if (builtin.os.tag != .windows) {
+            _ = try os.poll(&fds, 60 * 15 * 1000);
+        } else {
+            _ = try poll(&fds, 60 * 15 * 1000);
+        }
 
         var in = if (fds[0].revents & event > 0) strm1 else strm2;
         var out = if (std.meta.eql(in, strm2)) strm1 else strm2;
@@ -188,6 +197,26 @@ pub fn readAddress(stream: net.Stream) !net.Address {
         },
     }
     return try net.Address.parseIp(addr, port);
+}
+
+fn poll(fds: []os.pollfd, timeout: i32) os.PollError!usize {
+    while (true) {
+        const fds_count = std.math.cast(os.nfds_t, fds.len) orelse
+            return error.SystemResources;
+        const rc = windows.ws2_32.WSAPoll(fds.ptr, fds_count, timeout);
+        if (rc == windows.ws2_32.SOCKET_ERROR) {
+            switch (windows.ws2_32.WSAGetLastError()) {
+                .WSANOTINITIALISED => unreachable,
+                .WSAENETDOWN => return error.NetworkSubsystemFailed,
+                .WSAENOBUFS => return error.SystemResources,
+                // TODO: handle more errors
+                else => |err| return windows.unexpectedWSAError(err),
+            }
+        } else {
+            return @intCast(usize, rc);
+        }
+        unreachable;
+    }
 }
 
 pub const AddressType = enum(u8) {

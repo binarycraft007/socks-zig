@@ -13,12 +13,22 @@ pub fn main() !void {
 
     var allocator = arena.allocator();
 
-    const sigact = os.Sigaction{
-        .handler = .{ .handler = os.SIG.IGN },
-        .mask = os.empty_sigset,
-        .flags = 0,
-    };
-    try os.sigaction(os.SIG.PIPE, &sigact, null);
+    if (builtin.os.tag == .windows)
+        _ = try os.windows.WSAStartup(2, 2);
+
+    defer {
+        if (builtin.os.tag == .windows)
+            os.windows.WSACleanup() catch unreachable;
+    }
+
+    if (builtin.os.tag != .windows) {
+        const act = os.Sigaction{
+            .handler = .{ .handler = os.SIG.IGN },
+            .mask = os.empty_sigset,
+            .flags = 0,
+        };
+        try os.sigaction(os.SIG.PIPE, &act, null);
+    }
 
     var thread_pool: ThreadPool = undefined;
     try thread_pool.init(allocator);
