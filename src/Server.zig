@@ -85,11 +85,11 @@ fn worker(server: *net.StreamServer, wg: *WaitGroup) void {
     }
 }
 
-pub fn copyLoop(strm1: net.Stream, strm2: net.Stream) !void {
+fn copyLoop(strm1: net.Stream, strm2: net.Stream) !void {
     const event = if (builtin.os.tag != .windows) blk: {
         break :blk os.POLL.IN;
     } else blk: {
-        break :blk os.POLL.RDNORM & os.POLL.RDBAND;
+        break :blk os.POLL.RDNORM | os.POLL.RDBAND;
     };
 
     var fds = [_]os.pollfd{
@@ -124,7 +124,7 @@ pub fn copyLoop(strm1: net.Stream, strm2: net.Stream) !void {
 /// +----+-----+-------+------+----------+----------+
 /// | 1  |  1  | X'00' |  1   | Variable |    2     |
 /// +----+-----+-------+------+----------+----------+
-pub fn connectHandler(stream: net.Stream, metadata: MetaData) !net.Stream {
+fn connectHandler(stream: net.Stream, metadata: MetaData) !net.Stream {
     var remote = net.tcpConnectToAddress(metadata.address) catch |err| {
         var fail = [_]u8{ 5, 4, 0, 1, 0, 0, 0, 0, 0, 0 };
         _ = try stream.writer().write(&fail);
@@ -142,7 +142,7 @@ pub fn connectHandler(stream: net.Stream, metadata: MetaData) !net.Stream {
 /// +----+----------+----------+  +----+--------+
 /// | 1  |    1     | 1 to 255 |  | 1  |   1    |
 /// +----+----------+----------+  +----+--------+
-pub fn handshakeHandler(stream: net.Stream) !MetaData {
+fn handshakeHandler(stream: net.Stream) !MetaData {
     var version = try stream.reader().readBoundedBytes(1);
 
     if (version.slice()[0] != 5) {
@@ -165,7 +165,7 @@ pub fn handshakeHandler(stream: net.Stream) !MetaData {
     };
 }
 
-pub fn readAddress(stream: net.Stream) !net.Address {
+fn readAddress(stream: net.Stream) !net.Address {
     var port: u16 = undefined;
     var addr: []u8 = undefined;
 
@@ -219,19 +219,19 @@ fn poll(fds: []os.pollfd, timeout: i32) os.PollError!usize {
     }
 }
 
-pub const AddressType = enum(u8) {
+const AddressType = enum(u8) {
     ipv4_addr = 0x01,
     domain_name = 0x03,
     ipv6_addr = 0x04,
 };
 
-pub const Command = enum(u8) {
+const Command = enum(u8) {
     connect = 0x01,
     bind = 0x02,
     associate = 0x03,
 };
 
-pub const MetaData = struct {
+const MetaData = struct {
     command: Command,
     address: net.Address,
 };
