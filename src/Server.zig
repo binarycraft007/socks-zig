@@ -137,15 +137,6 @@ pub const EventLoop = struct {
                 0,
             );
 
-            while (!self.client_read_once_done) try self.io.tick();
-            self.client_read_once_done = false;
-
-            if (self.client_read_done) {
-                break;
-            }
-        }
-
-        while (true) {
             var remote_read_completion: IO.Completion = undefined;
             self.io.read(
                 *EventLoop,
@@ -159,10 +150,6 @@ pub const EventLoop = struct {
 
             while (!self.remote_read_once_done) try self.io.tick();
             self.remote_read_once_done = false;
-
-            if (self.remote_read_done) {
-                break;
-            }
         }
     }
 
@@ -192,10 +179,6 @@ pub const EventLoop = struct {
         _ = completion;
         self.write_n = result catch |err| @panic(@errorName(err));
         self.client_read_once_done = true;
-
-        if (self.write_n < self.buffer.len) {
-            self.client_read_done = true;
-        }
     }
 
     fn on_read_remote(
@@ -223,11 +206,8 @@ pub const EventLoop = struct {
     ) void {
         _ = completion;
         self.write_n = result catch |err| @panic(@errorName(err));
-        self.remote_read_once_done = true;
 
-        if (self.write_n < self.buffer.len) {
-            self.remote_read_done = true;
-        }
+        self.remote_read_once_done = true;
     }
 };
 
