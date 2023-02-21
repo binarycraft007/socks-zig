@@ -159,11 +159,11 @@ fn connectToAddress(
     stream: net.Stream,
     addr: net.Address,
 ) !net.Stream {
-    var remote = net.tcpConnectToAddress(addr) catch |err| {
+    var remote = try net.tcpConnectToAddress(addr);
+    errdefer {
         var fail = [_]u8{ 5, 4, 0, 1, 0, 0, 0, 0, 0, 0 };
-        _ = try stream.writer().write(&fail);
-        return err;
-    };
+        _ = stream.writer().write(&fail) catch unreachable;
+    }
 
     var success = [_]u8{ 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
     _ = try stream.writer().write(&success);
@@ -172,20 +172,17 @@ fn connectToAddress(
 }
 
 fn connectToDomain(
-    allocator: mem.Allocator,
+    gpa: mem.Allocator,
     stream: net.Stream,
     name: []const u8,
     port: u16,
 ) !net.Stream {
-    var remote = net.tcpConnectToHost(
-        allocator,
-        name,
-        port,
-    ) catch |err| {
+    log.debug("name: {s}, port: {d}", .{ name, port });
+    var remote = try net.tcpConnectToHost(gpa, name, port);
+    errdefer {
         var fail = [_]u8{ 5, 4, 0, 1, 0, 0, 0, 0, 0, 0 };
-        _ = try stream.writer().write(&fail);
-        return err;
-    };
+        _ = stream.writer().write(&fail) catch unreachable;
+    }
 
     var success = [_]u8{ 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
     _ = try stream.writer().write(&success);
