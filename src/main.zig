@@ -34,7 +34,12 @@ pub fn main() !void {
     try thread_pool.init(allocator);
     defer thread_pool.deinit();
 
-    var server = try Server.init(&thread_pool);
+    var server = try Server.init(
+        .{
+            .allocator = allocator,
+            .thread_pool = &thread_pool,
+        },
+    );
     defer server.deinit();
 
     try server.startServe("127.0.0.1", 1081);
