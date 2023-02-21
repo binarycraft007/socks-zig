@@ -143,24 +143,24 @@ fn connectHandler(stream: net.Stream, metadata: MetaData) !net.Stream {
 /// | 1  |    1     | 1 to 255 |  | 1  |   1    |
 /// +----+----------+----------+  +----+--------+
 fn handshakeHandler(stream: net.Stream) !MetaData {
-    var version = try stream.reader().readBoundedBytes(1);
+    var version = try stream.reader().readBytesNoEof(1);
 
-    if (version.slice()[0] != 5) {
+    if (version[0] != 5) {
         return error.SocksVersionUnsupported;
     }
 
-    var nmethods = try stream.reader().readBoundedBytes(1);
+    var nmethods = try stream.reader().readBytesNoEof(1);
 
     var methods: [255]u8 = [_]u8{0} ** 255;
-    _ = try stream.reader().read(methods[0..nmethods.slice()[0]]);
+    _ = try stream.reader().read(methods[0..nmethods[0]]);
 
     _ = try stream.writer().write(&[_]u8{ 5, 0x0 });
 
-    var cmd_buf = try stream.reader().readBoundedBytes(3);
+    var cmd_buf = try stream.reader().readBytesNoEof(3);
 
     log.info("handshake success, stream: {d}", .{stream.handle});
     return MetaData{
-        .command = @intToEnum(Command, cmd_buf.slice()[1]),
+        .command = @intToEnum(Command, cmd_buf[1]),
         .address = try readAddress(stream),
     };
 }
@@ -169,17 +169,14 @@ fn readAddress(stream: net.Stream) !net.Address {
     var port: u16 = undefined;
     var addr: []u8 = undefined;
 
-    var addr_type = try stream.reader().readBoundedBytes(1);
+    var addr_type = try stream.reader().readBytesNoEof(1);
 
-    switch (@intToEnum(AddressType, addr_type.slice()[0])) {
+    switch (@intToEnum(AddressType, addr_type[0])) {
         .ipv4_addr => {
             var buf: [15]u8 = undefined;
 
-            var addr_str = try stream.reader().readBoundedBytes(4);
-            var port_str = try stream.reader().readBoundedBytes(2);
-
-            var addr_s = addr_str.slice();
-            var port_s = port_str.slice();
+            var addr_s = try stream.reader().readBytesNoEof(4);
+            var port_s = try stream.reader().readBytesNoEof(2);
 
             addr = try fmt.bufPrint(
                 &buf,
@@ -193,7 +190,38 @@ fn readAddress(stream: net.Stream) !net.Address {
             return error.DomainNameUnimplemented;
         },
         .ipv6_addr => {
-            return error.Ipv6AddressUnimplemented;
+            var buf: [39]u8 = undefined;
+
+            var addr_s = try stream.reader().readBytesNoEof(16);
+            var port_s = try stream.reader().readBytesNoEof(2);
+
+            addr = try fmt.bufPrint(
+                &buf,
+                "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:" ++
+                    "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:" ++
+                    "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:" ++
+                    "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}",
+                .{
+                    addr_s[0],
+                    addr_s[1],
+                    addr_s[2],
+                    addr_s[3],
+                    addr_s[4],
+                    addr_s[5],
+                    addr_s[6],
+                    addr_s[7],
+                    addr_s[8],
+                    addr_s[9],
+                    addr_s[10],
+                    addr_s[11],
+                    addr_s[12],
+                    addr_s[13],
+                    addr_s[14],
+                    addr_s[15],
+                },
+            );
+
+            port = @as(u16, port_s[0]) << 8 | @as(u16, port_s[1]);
         },
     }
     return try net.Address.parseIp(addr, port);
