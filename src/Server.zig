@@ -1,30 +1,31 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const IO = @import("io").IO;
 const os = std.os;
 const log = std.log;
 const fmt = std.fmt;
 const mem = std.mem;
 const net = std.net;
 const meta = std.meta;
-const ThreadPool = @import("ThreadPool.zig");
-const WaitGroup = @import("WaitGroup.zig");
 const windows = std.os.windows;
 const Server = @This();
+const Context = Server;
 
-thread_pool: *ThreadPool = undefined,
+io: IO,
+client: net.Stream = undefined,
 stream_server: net.StreamServer,
+done: bool = false,
 
-pub fn init(thread_pool: *ThreadPool) !Server {
+pub fn init(io: IO) Server {
     var stream_server = net.StreamServer.init(.{});
 
     return Server{
-        .thread_pool = thread_pool,
+        .io = io,
         .stream_server = stream_server,
     };
 }
 
 pub fn deinit(self: *Server) void {
-    self.thread_pool.deinit();
     self.stream_server.deinit();
 }
 
@@ -33,23 +34,29 @@ pub fn startServe(self: *Server, listen_ip: []const u8, port: u16) !void {
     try self.stream_server.listen(listen_addr);
 
     while (true) {
-        var wg: WaitGroup = .{};
-        defer self.thread_pool.waitAndWork(&wg);
-
-        for (self.thread_pool.threads) |_| {
-            wg.start();
-            try self.thread_pool.spawn(worker, .{ &self.stream_server, &wg });
-        }
+        var completion: IO.Completion = undefined;
+        self.io.accept(
+            *Context,
+            self,
+            accept_callback,
+            &completion,
+            self.stream_server.sockfd.?,
+        );
+        while (!self.done) try self.io.tick();
+        self.done = false;
     }
 }
 
-fn worker(server: *net.StreamServer, wg: *WaitGroup) void {
-    defer wg.finish();
-
-    var client = server.accept() catch |err| {
-        std.log.err("accept error: {s}", .{@errorName(err)});
-        return;
+fn accept_callback(
+    self: *Context,
+    completion: *IO.Completion,
+    result: IO.AcceptError!os.socket_t,
+) void {
+    _ = completion;
+    self.client = net.Stream{
+        .handle = result catch @panic("accept error"),
     };
+<<<<<<< Updated upstream
     defer client.stream.close();
 
     std.log.info("got client connection: {d}", .{client.stream.handle});
@@ -197,6 +204,11 @@ pub fn readAddress(stream: net.Stream) !net.Address {
         },
     }
     return try net.Address.parseIp(addr, port);
+=======
+    defer self.client.close();
+    self.done = true;
+    log.info("accepted client: {}", .{self.client});
+>>>>>>> Stashed changes
 }
 
 fn poll(fds: []os.pollfd, timeout: i32) os.PollError!usize {
@@ -233,5 +245,10 @@ pub const Command = enum(u8) {
 
 pub const MetaData = struct {
     command: Command,
-    address: net.Address,
+    address: DomainAddress,
+};
+
+const DomainAddress = struct {
+    addr: ?net.Address,
+    name: ?[]const u8,
 };
