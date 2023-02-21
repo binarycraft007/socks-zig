@@ -14,6 +14,7 @@ const Context = Server;
 io: IO,
 buffer: [1024]u8 = undefined,
 client: net.Stream = undefined,
+command: Command = undefined,
 stream_server: net.StreamServer,
 done: bool = false,
 
@@ -60,14 +61,17 @@ fn onAccept(
     self.recvVersion(completion);
 }
 
-fn recvVersion(self: *Context, completion: *IO.Completion) void {
+fn recvVersion(
+    self: *Context,
+    completion: *IO.Completion,
+) void {
     self.io.recv(
         *Context,
         self,
         onRecvVersion,
         completion,
         self.client.handle,
-        self.buffer[0..1],
+        self.buffer[0..2],
     );
 }
 
@@ -76,12 +80,115 @@ fn onRecvVersion(
     completion: *IO.Completion,
     result: IO.RecvError!usize,
 ) void {
-    _ = completion;
-    defer self.client.close();
-    var len = result catch @panic("recv error");
-    self.done = true;
-    std.debug.assert(len == 1);
+    _ = result catch @panic("recv error");
     log.info("socks version: {d}", .{self.buffer[0]});
+    log.info("num of method: {d}", .{self.buffer[1]});
+    self.recvMethods(completion, self.buffer[1]);
+}
+
+fn recvMethods(
+    self: *Context,
+    completion: *IO.Completion,
+    num: usize,
+) void {
+    self.io.recv(
+        *Context,
+        self,
+        onRecvMethods,
+        completion,
+        self.client.handle,
+        self.buffer[0..num],
+    );
+}
+
+fn onRecvMethods(
+    self: *Context,
+    completion: *IO.Completion,
+    result: IO.RecvError!usize,
+) void {
+    _ = result catch |err| @panic(@errorName(err));
+    self.sendMethods(completion);
+}
+
+fn sendMethods(
+    self: *Context,
+    completion: *IO.Completion,
+) void {
+    self.io.send(
+        *Context,
+        self,
+        onSendMethods,
+        completion,
+        self.client.handle,
+        &[_]u8{ 5, 0 },
+    );
+}
+
+fn onSendMethods(
+    self: *Context,
+    completion: *IO.Completion,
+    result: IO.SendError!usize,
+) void {
+    _ = result catch @panic("send error");
+    self.recvCommand(completion);
+}
+
+fn recvCommand(
+    self: *Context,
+    completion: *IO.Completion,
+) void {
+    self.io.recv(
+        *Context,
+        self,
+        onRecvMethods,
+        completion,
+        self.client.handle,
+        self.buffer[0..3],
+    );
+}
+
+fn onRecvCommand(
+    self: *Context,
+    completion: *IO.Completion,
+    result: IO.RecvError!usize,
+) void {
+    _ = result catch @panic("recv error");
+    self.command = @intToEnum(Command, self.buffer[1]);
+
+    log.info("received cmd: {s}", .{@tagName(self.commmand)});
+
+    switch (self.command) {
+        .connect => {
+            self.recvAddrType(completion);
+        },
+        .associate => {},
+        .bind => {},
+    }
+}
+
+fn recvAddrType(
+    self: *Context,
+    completion: *IO.Completion,
+) void {
+    self.io.send(
+        *Context,
+        self,
+        onSendReplyMsg,
+        completion,
+        self.client.handle,
+        &[_]u8{ 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 },
+    );
+}
+
+fn onSendReplyMsg(
+    self: *Context,
+    completion: *IO.Completion,
+    result: IO.SendError!usize,
+) void {
+    _ = completion;
+    self.client.close();
+    _ = result catch @panic("recv error");
+    self.done = true;
 }
 
 fn poll(fds: []os.pollfd, timeout: i32) os.PollError!usize {
