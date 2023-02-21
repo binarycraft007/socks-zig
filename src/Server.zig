@@ -12,6 +12,7 @@ const Server = @This();
 const Context = Server;
 
 io: IO,
+buffer: [1024]u8 = undefined,
 client: net.Stream = undefined,
 stream_server: net.StreamServer,
 done: bool = false,
@@ -38,7 +39,7 @@ pub fn startServe(self: *Server, listen_ip: []const u8, port: u16) !void {
         self.io.accept(
             *Context,
             self,
-            accept_callback,
+            onAccept,
             &completion,
             self.stream_server.sockfd.?,
         );
@@ -47,18 +48,40 @@ pub fn startServe(self: *Server, listen_ip: []const u8, port: u16) !void {
     }
 }
 
-fn accept_callback(
+fn onAccept(
     self: *Context,
     completion: *IO.Completion,
     result: IO.AcceptError!os.socket_t,
 ) void {
-    _ = completion;
     self.client = net.Stream{
         .handle = result catch @panic("accept error"),
     };
-    defer self.client.close();
-    self.done = true;
     log.info("accepted client: {}", .{self.client});
+    self.recvVersion(completion);
+}
+
+fn recvVersion(self: *Context, completion: *IO.Completion) void {
+    self.io.recv(
+        *Context,
+        self,
+        onRecvVersion,
+        completion,
+        self.client.handle,
+        self.buffer[0..1],
+    );
+}
+
+fn onRecvVersion(
+    self: *Context,
+    completion: *IO.Completion,
+    result: IO.RecvError!usize,
+) void {
+    _ = completion;
+    defer self.client.close();
+    var len = result catch @panic("recv error");
+    self.done = true;
+    std.debug.assert(len == 1);
+    log.info("socks version: {d}", .{self.buffer[0]});
 }
 
 fn poll(fds: []os.pollfd, timeout: i32) os.PollError!usize {
