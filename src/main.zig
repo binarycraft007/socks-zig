@@ -21,5 +21,7 @@ pub fn main() !void {
     var server = Server.init(io);
     defer server.deinit();
 
-    try server.startServe("127.0.0.1", 1081);
+    try server.startServe(
+        .{ .addr = "127.0.0.1", .port = 1081 },
+    );
 }

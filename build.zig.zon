@@ -3,8 +3,8 @@
     .version = "0.0.1",
     .dependencies = .{
         .io = .{
-            .url = "https://github.com/binarycraft007/iouring-zig/archive/refs/tags/v0.0.2.tar.gz",
-            .hash = "122082def87edd3b874c551f6c03b6ca328e8a8eefc067483279590cf91b38da7ce0",
+            .url = "https://github.com/binarycraft007/iouring-zig/archive/refs/tags/v0.0.3.tar.gz",
+            .hash = "1220e07aafe394a0dde20dd94a017bf3dfa1ef09a7a392a711ba07f828f8b4ba8412",
         },
     },
 }

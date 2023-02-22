@@ -12,11 +12,21 @@ const Server = @This();
 const Context = Server;
 
 io: IO,
-buffer: [1024]u8 = undefined,
+buffer: [2048]u8 = undefined,
+addr: []const u8 = undefined,
+port: u16 = undefined,
 client: net.Stream = undefined,
+remote: net.Stream = undefined,
 command: Command = undefined,
+addr_type: AddressType = undefined,
+completion: IO.Completion = undefined,
 stream_server: net.StreamServer,
 done: bool = false,
+
+const ListenOptions = struct {
+    addr: []const u8,
+    port: u16,
+};
 
 pub fn init(io: IO) Server {
     var stream_server = net.StreamServer.init(.{});
@@ -31,19 +41,22 @@ pub fn deinit(self: *Server) void {
     self.stream_server.deinit();
 }
 
-pub fn startServe(self: *Server, listen_ip: []const u8, port: u16) !void {
-    const listen_addr = try net.Address.parseIp(listen_ip, port);
+pub fn startServe(self: *Server, opts: ListenOptions) !void {
+    const listen_addr = try net.Address.parseIp(
+        opts.addr,
+        opts.port,
+    );
     try self.stream_server.listen(listen_addr);
 
     while (true) {
-        var completion: IO.Completion = undefined;
         self.io.accept(
             *Context,
             self,
             onAccept,
-            &completion,
+            &self.completion,
             self.stream_server.sockfd.?,
         );
+
         while (!self.done) try self.io.tick();
         self.done = false;
     }
@@ -57,6 +70,7 @@ fn onAccept(
     self.client = net.Stream{
         .handle = result catch @panic("accept error"),
     };
+
     log.info("accepted client: {}", .{self.client});
     self.recvVersion(completion);
 }
@@ -140,10 +154,10 @@ fn recvCommand(
     self.io.recv(
         *Context,
         self,
-        onRecvMethods,
+        onRecvCommand,
         completion,
         self.client.handle,
-        self.buffer[0..3],
+        self.buffer[0..4],
     );
 }
 
@@ -154,19 +168,131 @@ fn onRecvCommand(
 ) void {
     _ = result catch @panic("recv error");
     self.command = @intToEnum(Command, self.buffer[1]);
-
-    log.info("received cmd: {s}", .{@tagName(self.commmand)});
+    self.addr_type = @intToEnum(AddressType, self.buffer[3]);
+    log.info("recv cmd: {s}", .{@tagName(self.command)});
+    log.info("recv addr: {s}", .{@tagName(self.addr_type)});
 
     switch (self.command) {
         .connect => {
-            self.recvAddrType(completion);
+            switch (self.addr_type) {
+                .ipv4_addr => {
+                    self.recvIpv4Addr(completion);
+                },
+                .domain_name => {
+                    // TODO
+                },
+                .ipv6_addr => {
+                    // TODO
+                },
+            }
         },
-        .associate => {},
-        .bind => {},
+        .associate => {
+            // TODO
+        },
+        .bind => {
+            // TODO
+        },
     }
 }
 
-fn recvAddrType(
+fn recvIpv4Addr(
+    self: *Context,
+    completion: *IO.Completion,
+) void {
+    self.io.recv(
+        *Context,
+        self,
+        onRecvIpv4Addr,
+        completion,
+        self.client.handle,
+        self.buffer[0..4],
+    );
+}
+
+fn onRecvIpv4Addr(
+    self: *Context,
+    completion: *IO.Completion,
+    result: IO.RecvError!usize,
+) void {
+    _ = result catch @panic("recv error");
+    self.addr = fmt.bufPrint(
+        self.buffer[4 .. 4 + 15],
+        "{}.{}.{}.{}",
+        .{
+            self.buffer[0],
+            self.buffer[1],
+            self.buffer[2],
+            self.buffer[3],
+        },
+    ) catch |err| @panic(@errorName(err));
+    self.recvPortNumber(completion);
+}
+
+fn recvPortNumber(
+    self: *Context,
+    completion: *IO.Completion,
+) void {
+    self.io.recv(
+        *Context,
+        self,
+        onRecvPortNumber,
+        completion,
+        self.client.handle,
+        self.buffer[0..2],
+    );
+}
+
+fn onRecvPortNumber(
+    self: *Context,
+    completion: *IO.Completion,
+    result: IO.RecvError!usize,
+) void {
+    _ = result catch @panic("recv error");
+    self.port = @as(u16, self.buffer[0]) <<
+        8 | self.buffer[1];
+    var address = net.Address.parseIp(
+        self.addr,
+        self.port,
+    ) catch |err| @panic(@errorName(err));
+    log.debug("addr: {s}", .{self.addr});
+    log.debug("port: {d}", .{self.port});
+    self.connectToRemote(completion, address);
+}
+
+fn connectToRemote(
+    self: *Context,
+    completion: *IO.Completion,
+    address: net.Address,
+) void {
+    self.remote = net.Stream{
+        .handle = os.socket(
+            address.any.family,
+            os.SOCK.STREAM,
+            os.IPPROTO.TCP,
+        ) catch |err| @panic(@errorName(err)),
+    };
+
+    log.info("connect to: {}", .{address});
+    self.io.connect(
+        *Context,
+        self,
+        onConnectToRemote,
+        completion,
+        self.remote.handle,
+        address,
+    );
+}
+
+fn onConnectToRemote(
+    self: *Context,
+    completion: *IO.Completion,
+    result: IO.ConnectError!void,
+) void {
+    _ = result catch |err| @panic(@errorName(err));
+    self.sendReplyMsg(completion);
+}
+
+fn sendReplyMsg(
     self: *Context,
     completion: *IO.Completion,
 ) void {
@@ -185,10 +311,110 @@ fn onSendReplyMsg(
     completion: *IO.Completion,
     result: IO.SendError!usize,
 ) void {
-    _ = completion;
-    self.client.close();
     _ = result catch @panic("recv error");
-    self.done = true;
+    self.recvClientReq(completion);
+}
+
+fn recvClientReq(
+    self: *Context,
+    completion: *IO.Completion,
+) void {
+    self.io.recv(
+        *Context,
+        self,
+        onRecvClientReq,
+        completion,
+        self.client.handle,
+        &self.buffer,
+    );
+}
+
+fn onRecvClientReq(
+    self: *Context,
+    completion: *IO.Completion,
+    result: IO.RecvError!usize,
+) void {
+    var len = result catch @panic("recv error");
+    log.info("recv client len: {d}", .{len});
+    log.info("method: {s}", .{self.buffer[0..4]});
+    self.sendReqRemote(completion, len);
+}
+
+fn sendReqRemote(
+    self: *Context,
+    completion: *IO.Completion,
+    msg_len: usize,
+) void {
+    self.io.send(
+        *Context,
+        self,
+        onSendReqRemote,
+        completion,
+        self.remote.handle,
+        self.buffer[0..msg_len],
+    );
+}
+
+fn onSendReqRemote(
+    self: *Context,
+    completion: *IO.Completion,
+    result: IO.SendError!usize,
+) void {
+    var len = result catch @panic("recv error");
+    log.info("send remote len: {d}", .{len});
+    self.recvRemoteRsp(completion);
+}
+
+fn recvRemoteRsp(
+    self: *Context,
+    completion: *IO.Completion,
+) void {
+    self.io.recv(
+        *Context,
+        self,
+        onRecvRemoteRsp,
+        completion,
+        self.remote.handle,
+        &self.buffer,
+    );
+}
+
+fn onRecvRemoteRsp(
+    self: *Context,
+    completion: *IO.Completion,
+    result: IO.RecvError!usize,
+) void {
+    var len = result catch @panic("recv error");
+    log.info("recv remote len: {d}", .{len});
+    self.sendRspClient(completion, len);
+}
+
+fn sendRspClient(
+    self: *Context,
+    completion: *IO.Completion,
+    msg_len: usize,
+) void {
+    self.io.send(
+        *Context,
+        self,
+        onSendRspClient,
+        completion,
+        self.client.handle,
+        self.buffer[0..msg_len],
+    );
+}
+
+fn onSendRspClient(
+    self: *Context,
+    completion: *IO.Completion,
+    result: IO.SendError!usize,
+) void {
+    _ = completion;
+    defer self.client.close();
+    defer self.remote.close();
+    defer self.done = true;
+    var len = result catch @panic("recv error");
+    log.info("recv remote len: {d}", .{len});
 }
 
 fn poll(fds: []os.pollfd, timeout: i32) os.PollError!usize {
