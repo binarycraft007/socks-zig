@@ -6,14 +6,6 @@ const builtin = @import("builtin");
 const Server = @import("Server.zig");
 
 pub fn main() !void {
-    if (builtin.os.tag == .windows)
-        _ = try os.windows.WSAStartup(2, 2);
-
-    defer {
-        if (builtin.os.tag == .windows)
-            os.windows.WSACleanup() catch unreachable;
-    }
-
     if (builtin.os.tag != .windows) {
         const act = os.Sigaction{
             .handler = .{ .handler = os.SIG.IGN },
