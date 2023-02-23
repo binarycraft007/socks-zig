@@ -397,6 +397,12 @@ fn onRecvClientReq(
         self.compl_list.popFirst().?.data,
         len,
     );
+
+    if (len != 0) {
+        self.recvClientReq(
+            self.compl_list.popFirst().?.data,
+        );
+    }
 }
 
 fn sendReqRemote(
