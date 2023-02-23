@@ -1,4 +1,5 @@
 const std = @import("std");
+const BoundedArray = std.BoundedArray;
 const builtin = @import("builtin");
 const IO = @import("io").IO;
 const os = std.os;
@@ -7,19 +8,20 @@ const fmt = std.fmt;
 const mem = std.mem;
 const net = std.net;
 const meta = std.meta;
+const http = std.http;
 const windows = std.os.windows;
 const Server = @This();
 const Context = Server;
 
 io: IO,
-buffer: [2048]u8 = undefined,
+buffer: [8192]u8 = undefined,
 addr: []const u8 = undefined,
 port: u16 = undefined,
 client: net.Stream = undefined,
 remote: net.Stream = undefined,
 command: Command = undefined,
 addr_type: AddressType = undefined,
-completion: IO.Completion = undefined,
+compls: [20]IO.Completion = undefined,
 stream_server: net.StreamServer,
 done: bool = false,
 
@@ -29,11 +31,9 @@ const ListenOptions = struct {
 };
 
 pub fn init(io: IO) Server {
-    var stream_server = net.StreamServer.init(.{});
-
     return Server{
         .io = io,
-        .stream_server = stream_server,
+        .stream_server = net.StreamServer.init(.{}),
     };
 }
 
@@ -48,42 +48,56 @@ pub fn startServe(self: *Server, opts: ListenOptions) !void {
     );
     try self.stream_server.listen(listen_addr);
 
-    while (true) {
-        self.io.accept(
-            *Context,
-            self,
-            onAccept,
-            &self.completion,
-            self.stream_server.sockfd.?,
-        );
-
-        while (!self.done) try self.io.tick();
-        self.done = false;
-    }
+    self.acceptConnection(&self.compls[0]);
+    while (true) try self.io.tick();
 }
 
-fn onAccept(
+fn acceptConnection(
+    self: *Context,
+    completion: *IO.Completion,
+) void {
+    self.io.accept(
+        *Context,
+        self,
+        onAcceptConnection,
+        completion,
+        self.stream_server.sockfd.?,
+    );
+}
+
+fn onAcceptConnection(
     self: *Context,
     completion: *IO.Completion,
     result: IO.AcceptError!os.socket_t,
 ) void {
+    _ = completion;
+
     self.client = net.Stream{
-        .handle = result catch @panic("accept error"),
+        .handle = result catch |err| switch (err) {
+            error.FileDescriptorInvalid => return,
+            else => {
+                log.err("{s}", .{@errorName(err)});
+                return;
+            },
+        },
     };
 
     log.info("accepted client: {}", .{self.client});
-    self.recvVersion(completion);
+
+    self.recvVersion(&self.compls[1]);
+    self.acceptConnection(&self.compls[2]);
 }
 
 fn recvVersion(
     self: *Context,
     completion: *IO.Completion,
 ) void {
+    _ = completion;
     self.io.recv(
         *Context,
         self,
         onRecvVersion,
-        completion,
+        &self.compls[3],
         self.client.handle,
         self.buffer[0..2],
     );
@@ -94,10 +108,12 @@ fn onRecvVersion(
     completion: *IO.Completion,
     result: IO.RecvError!usize,
 ) void {
-    _ = result catch @panic("recv error");
+    _ = completion;
+
+    _ = result catch |err| @panic(@errorName(err));
     log.info("socks version: {d}", .{self.buffer[0]});
     log.info("num of method: {d}", .{self.buffer[1]});
-    self.recvMethods(completion, self.buffer[1]);
+    self.recvMethods(&self.compls[4], self.buffer[1]);
 }
 
 fn recvMethods(
@@ -105,11 +121,13 @@ fn recvMethods(
     completion: *IO.Completion,
     num: usize,
 ) void {
+    _ = completion;
+
     self.io.recv(
         *Context,
         self,
         onRecvMethods,
-        completion,
+        &self.compls[5],
         self.client.handle,
         self.buffer[0..num],
     );
@@ -120,19 +138,22 @@ fn onRecvMethods(
     completion: *IO.Completion,
     result: IO.RecvError!usize,
 ) void {
+    _ = completion;
+
     _ = result catch |err| @panic(@errorName(err));
-    self.sendMethods(completion);
+    self.sendMethods(&self.compls[6]);
 }
 
 fn sendMethods(
     self: *Context,
     completion: *IO.Completion,
 ) void {
+    _ = completion;
     self.io.send(
         *Context,
         self,
         onSendMethods,
-        completion,
+        &self.compls[7],
         self.client.handle,
         &[_]u8{ 5, 0 },
     );
@@ -143,8 +164,10 @@ fn onSendMethods(
     completion: *IO.Completion,
     result: IO.SendError!usize,
 ) void {
+    _ = completion;
     _ = result catch @panic("send error");
-    self.recvCommand(completion);
+    defer self.client.close();
+    //self.recvCommand(completion);
 }
 
 fn recvCommand(
@@ -336,8 +359,14 @@ fn onRecvClientReq(
 ) void {
     var len = result catch @panic("recv error");
     log.info("recv client len: {d}", .{len});
-    log.info("method: {s}", .{self.buffer[0..4]});
-    self.sendReqRemote(completion, len);
+    if (self.buffer[0] == 0x16) {
+        log.info("tls unsupported", .{});
+        defer self.client.close();
+        defer self.remote.close();
+        self.done = true;
+    } else {
+        self.sendReqRemote(completion, len);
+    }
 }
 
 fn sendReqRemote(
@@ -385,6 +414,12 @@ fn onRecvRemoteRsp(
     result: IO.RecvError!usize,
 ) void {
     var len = result catch @panic("recv error");
+    log.info(
+        "last index: {d}",
+        .{
+            mem.lastIndexOf(u8, self.buffer[0..len], "\r\n\r\n").?,
+        },
+    );
     log.info("recv remote len: {d}", .{len});
     self.sendRspClient(completion, len);
 }
@@ -410,31 +445,14 @@ fn onSendRspClient(
     result: IO.SendError!usize,
 ) void {
     _ = completion;
+    var len = result catch @panic("recv error");
+    var idx = mem.lastIndexOf(u8, self.buffer[0..len], "\r\n\r\n").?;
+    var headers = http.Client.Request.Response.Headers.parse(self.buffer[0 .. idx + 4]) catch |err| @panic(@errorName(err));
+    log.info("content_length: {d}", .{headers.content_length.?});
     defer self.client.close();
     defer self.remote.close();
     defer self.done = true;
-    var len = result catch @panic("recv error");
-    log.info("recv remote len: {d}", .{len});
-}
-
-fn poll(fds: []os.pollfd, timeout: i32) os.PollError!usize {
-    while (true) {
-        const fds_count = std.math.cast(os.nfds_t, fds.len) orelse
-            return error.SystemResources;
-        const rc = windows.ws2_32.WSAPoll(fds.ptr, fds_count, timeout);
-        if (rc == windows.ws2_32.SOCKET_ERROR) {
-            switch (windows.ws2_32.WSAGetLastError()) {
-                .WSANOTINITIALISED => unreachable,
-                .WSAENETDOWN => return error.NetworkSubsystemFailed,
-                .WSAENOBUFS => return error.SystemResources,
-                // TODO: handle more errors
-                else => |err| return windows.unexpectedWSAError(err),
-            }
-        } else {
-            return @intCast(usize, rc);
-        }
-        unreachable;
-    }
+    log.info("send client len: {d}", .{len});
 }
 
 pub const AddressType = enum(u8) {
