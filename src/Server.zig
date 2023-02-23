@@ -21,7 +21,7 @@ client: net.Stream = undefined,
 remote: net.Stream = undefined,
 command: Command = undefined,
 addr_type: AddressType = undefined,
-compls: [20]IO.Completion = undefined,
+compls: [27]IO.Completion = undefined,
 stream_server: net.StreamServer,
 done: bool = false,
 
@@ -56,11 +56,12 @@ fn acceptConnection(
     self: *Context,
     completion: *IO.Completion,
 ) void {
+    _ = completion;
     self.io.accept(
         *Context,
         self,
         onAcceptConnection,
-        completion,
+        &self.compls[1],
         self.stream_server.sockfd.?,
     );
 }
@@ -71,7 +72,6 @@ fn onAcceptConnection(
     result: IO.AcceptError!os.socket_t,
 ) void {
     _ = completion;
-
     self.client = net.Stream{
         .handle = result catch |err| switch (err) {
             error.FileDescriptorInvalid => return,
@@ -84,8 +84,8 @@ fn onAcceptConnection(
 
     log.info("accepted client: {}", .{self.client});
 
-    self.recvVersion(&self.compls[1]);
-    self.acceptConnection(&self.compls[2]);
+    self.recvVersion(&self.compls[2]);
+    self.acceptConnection(&self.compls[3]);
 }
 
 fn recvVersion(
@@ -97,7 +97,7 @@ fn recvVersion(
         *Context,
         self,
         onRecvVersion,
-        &self.compls[3],
+        &self.compls[4],
         self.client.handle,
         self.buffer[0..2],
     );
@@ -109,11 +109,10 @@ fn onRecvVersion(
     result: IO.RecvError!usize,
 ) void {
     _ = completion;
-
     _ = result catch |err| @panic(@errorName(err));
     log.info("socks version: {d}", .{self.buffer[0]});
     log.info("num of method: {d}", .{self.buffer[1]});
-    self.recvMethods(&self.compls[4], self.buffer[1]);
+    self.recvMethods(&self.compls[5], self.buffer[1]);
 }
 
 fn recvMethods(
@@ -122,12 +121,11 @@ fn recvMethods(
     num: usize,
 ) void {
     _ = completion;
-
     self.io.recv(
         *Context,
         self,
         onRecvMethods,
-        &self.compls[5],
+        &self.compls[6],
         self.client.handle,
         self.buffer[0..num],
     );
@@ -139,9 +137,8 @@ fn onRecvMethods(
     result: IO.RecvError!usize,
 ) void {
     _ = completion;
-
     _ = result catch |err| @panic(@errorName(err));
-    self.sendMethods(&self.compls[6]);
+    self.sendMethods(&self.compls[7]);
 }
 
 fn sendMethods(
@@ -153,7 +150,7 @@ fn sendMethods(
         *Context,
         self,
         onSendMethods,
-        &self.compls[7],
+        &self.compls[8],
         self.client.handle,
         &[_]u8{ 5, 0 },
     );
@@ -166,19 +163,19 @@ fn onSendMethods(
 ) void {
     _ = completion;
     _ = result catch @panic("send error");
-    defer self.client.close();
-    //self.recvCommand(completion);
+    self.recvCommand(&self.compls[9]);
 }
 
 fn recvCommand(
     self: *Context,
     completion: *IO.Completion,
 ) void {
+    _ = completion;
     self.io.recv(
         *Context,
         self,
         onRecvCommand,
-        completion,
+        &self.compls[10],
         self.client.handle,
         self.buffer[0..4],
     );
@@ -189,6 +186,7 @@ fn onRecvCommand(
     completion: *IO.Completion,
     result: IO.RecvError!usize,
 ) void {
+    _ = completion;
     _ = result catch @panic("recv error");
     self.command = @intToEnum(Command, self.buffer[1]);
     self.addr_type = @intToEnum(AddressType, self.buffer[3]);
@@ -199,7 +197,7 @@ fn onRecvCommand(
         .connect => {
             switch (self.addr_type) {
                 .ipv4_addr => {
-                    self.recvIpv4Addr(completion);
+                    self.recvIpv4Addr(&self.compls[11]);
                 },
                 .domain_name => {
                     // TODO
@@ -222,11 +220,12 @@ fn recvIpv4Addr(
     self: *Context,
     completion: *IO.Completion,
 ) void {
+    _ = completion;
     self.io.recv(
         *Context,
         self,
         onRecvIpv4Addr,
-        completion,
+        &self.compls[12],
         self.client.handle,
         self.buffer[0..4],
     );
@@ -237,6 +236,7 @@ fn onRecvIpv4Addr(
     completion: *IO.Completion,
     result: IO.RecvError!usize,
 ) void {
+    _ = completion;
     _ = result catch @panic("recv error");
     self.addr = fmt.bufPrint(
         self.buffer[4 .. 4 + 15],
@@ -248,18 +248,19 @@ fn onRecvIpv4Addr(
             self.buffer[3],
         },
     ) catch |err| @panic(@errorName(err));
-    self.recvPortNumber(completion);
+    self.recvPortNumber(&self.compls[13]);
 }
 
 fn recvPortNumber(
     self: *Context,
     completion: *IO.Completion,
 ) void {
+    _ = completion;
     self.io.recv(
         *Context,
         self,
         onRecvPortNumber,
-        completion,
+        &self.compls[14],
         self.client.handle,
         self.buffer[0..2],
     );
@@ -270,6 +271,7 @@ fn onRecvPortNumber(
     completion: *IO.Completion,
     result: IO.RecvError!usize,
 ) void {
+    _ = completion;
     _ = result catch @panic("recv error");
     self.port = @as(u16, self.buffer[0]) <<
         8 | self.buffer[1];
@@ -279,7 +281,7 @@ fn onRecvPortNumber(
     ) catch |err| @panic(@errorName(err));
     log.debug("addr: {s}", .{self.addr});
     log.debug("port: {d}", .{self.port});
-    self.connectToRemote(completion, address);
+    self.connectToRemote(&self.compls[15], address);
 }
 
 fn connectToRemote(
@@ -287,6 +289,7 @@ fn connectToRemote(
     completion: *IO.Completion,
     address: net.Address,
 ) void {
+    _ = completion;
     self.remote = net.Stream{
         .handle = os.socket(
             address.any.family,
@@ -300,7 +303,7 @@ fn connectToRemote(
         *Context,
         self,
         onConnectToRemote,
-        completion,
+        &self.compls[16],
         self.remote.handle,
         address,
     );
@@ -311,19 +314,21 @@ fn onConnectToRemote(
     completion: *IO.Completion,
     result: IO.ConnectError!void,
 ) void {
+    _ = completion;
     _ = result catch |err| @panic(@errorName(err));
-    self.sendReplyMsg(completion);
+    self.sendReplyMsg(&self.compls[17]);
 }
 
 fn sendReplyMsg(
     self: *Context,
     completion: *IO.Completion,
 ) void {
+    _ = completion;
     self.io.send(
         *Context,
         self,
         onSendReplyMsg,
-        completion,
+        &self.compls[18],
         self.client.handle,
         &[_]u8{ 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 },
     );
@@ -334,19 +339,21 @@ fn onSendReplyMsg(
     completion: *IO.Completion,
     result: IO.SendError!usize,
 ) void {
+    _ = completion;
     _ = result catch @panic("recv error");
-    self.recvClientReq(completion);
+    self.recvClientReq(&self.compls[19]);
 }
 
 fn recvClientReq(
     self: *Context,
     completion: *IO.Completion,
 ) void {
+    _ = completion;
     self.io.recv(
         *Context,
         self,
         onRecvClientReq,
-        completion,
+        &self.compls[20],
         self.client.handle,
         &self.buffer,
     );
@@ -357,16 +364,10 @@ fn onRecvClientReq(
     completion: *IO.Completion,
     result: IO.RecvError!usize,
 ) void {
+    _ = completion;
     var len = result catch @panic("recv error");
     log.info("recv client len: {d}", .{len});
-    if (self.buffer[0] == 0x16) {
-        log.info("tls unsupported", .{});
-        defer self.client.close();
-        defer self.remote.close();
-        self.done = true;
-    } else {
-        self.sendReqRemote(completion, len);
-    }
+    self.sendReqRemote(&self.compls[21], len);
 }
 
 fn sendReqRemote(
@@ -374,11 +375,12 @@ fn sendReqRemote(
     completion: *IO.Completion,
     msg_len: usize,
 ) void {
+    _ = completion;
     self.io.send(
         *Context,
         self,
         onSendReqRemote,
-        completion,
+        &self.compls[22],
         self.remote.handle,
         self.buffer[0..msg_len],
     );
@@ -389,20 +391,22 @@ fn onSendReqRemote(
     completion: *IO.Completion,
     result: IO.SendError!usize,
 ) void {
+    _ = completion;
     var len = result catch @panic("recv error");
     log.info("send remote len: {d}", .{len});
-    self.recvRemoteRsp(completion);
+    self.recvRemoteRsp(&self.compls[23]);
 }
 
 fn recvRemoteRsp(
     self: *Context,
     completion: *IO.Completion,
 ) void {
+    _ = completion;
     self.io.recv(
         *Context,
         self,
         onRecvRemoteRsp,
-        completion,
+        &self.compls[24],
         self.remote.handle,
         &self.buffer,
     );
@@ -413,15 +417,10 @@ fn onRecvRemoteRsp(
     completion: *IO.Completion,
     result: IO.RecvError!usize,
 ) void {
+    _ = completion;
     var len = result catch @panic("recv error");
-    log.info(
-        "last index: {d}",
-        .{
-            mem.lastIndexOf(u8, self.buffer[0..len], "\r\n\r\n").?,
-        },
-    );
     log.info("recv remote len: {d}", .{len});
-    self.sendRspClient(completion, len);
+    self.sendRspClient(&self.compls[25], len);
 }
 
 fn sendRspClient(
@@ -429,11 +428,12 @@ fn sendRspClient(
     completion: *IO.Completion,
     msg_len: usize,
 ) void {
+    _ = completion;
     self.io.send(
         *Context,
         self,
         onSendRspClient,
-        completion,
+        &self.compls[26],
         self.client.handle,
         self.buffer[0..msg_len],
     );
@@ -446,12 +446,8 @@ fn onSendRspClient(
 ) void {
     _ = completion;
     var len = result catch @panic("recv error");
-    var idx = mem.lastIndexOf(u8, self.buffer[0..len], "\r\n\r\n").?;
-    var headers = http.Client.Request.Response.Headers.parse(self.buffer[0 .. idx + 4]) catch |err| @panic(@errorName(err));
-    log.info("content_length: {d}", .{headers.content_length.?});
     defer self.client.close();
     defer self.remote.close();
-    defer self.done = true;
     log.info("send client len: {d}", .{len});
 }
 
