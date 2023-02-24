@@ -90,6 +90,7 @@ fn onAcceptConnection(
         log.err("{s}", .{@errorName(err)});
         return;
     };
+    log.info("handshake session init done", .{});
     handshake.recvFromClient();
     self.acceptConnection();
 }
@@ -97,8 +98,7 @@ fn onAcceptConnection(
 const HandshakeSession = struct {
     const Self = @This();
 
-    const SessionState = enum {
-        greet_start,
+    const State = enum {
         completed,
         need_more,
         failed,
@@ -112,21 +112,21 @@ const HandshakeSession = struct {
 
     io: IO,
     gpa: mem.Allocator,
-    state: SessionState,
+    state_fn: *const fn (self: *Self) State,
     client_fd: os.socket_t,
     remote_fd: os.socket_t = undefined,
     recv_compl: IO.Completion = undefined,
     send_compl: IO.Completion = undefined,
     conn_compl: IO.Completion = undefined,
     buffer: [1024]u8 = undefined,
-    read_buf: RingBuffer,
-    write_buf: RingBuffer,
+    read_buf: RingBuffer = undefined,
+    write_buf: RingBuffer = undefined,
 
     pub fn init(opts: SessionInitOptions) !Self {
         return Self{
             .gpa = opts.gpa,
             .io = opts.io,
-            .state = .greet_start,
+            .state_fn = Greet,
             .client_fd = opts.client_fd,
             .read_buf = try RingBuffer.init(
                 opts.gpa,
@@ -156,6 +156,7 @@ const HandshakeSession = struct {
         result: IO.RecvError!usize,
     ) void {
         _ = completion;
+        log.info("recv from client", .{});
         var len = result catch |err| {
             log.err("{s}", .{@errorName(err)});
             self.deinit();
@@ -167,17 +168,18 @@ const HandshakeSession = struct {
             self.deinit();
             return;
         };
-        switch (self.state) {
-            .greet_start => {
-                self.state = self.Greet();
+
+        switch (self.state_fn(self)) {
+            .need_more => {
+                self.recvFromClient();
             },
-            .need_more => {},
             .failed => {},
             .completed => {},
         }
     }
 
-    pub fn Greet(self: *Self) SessionState {
+    pub fn Greet(self: *Self) State {
+        log.info("socks start greeting", .{});
         var needed_len = self.read_buf.data[1] + 2;
         if (self.read_buf.read_index < needed_len) {
             return .need_more;
@@ -185,6 +187,7 @@ const HandshakeSession = struct {
 
         var version = self.read_buf.data[0];
 
+        log.info("socks version: {d}", .{version});
         if (version != 0x05) {}
 
         var nmethods = self.read_buf.data[1];
@@ -200,7 +203,7 @@ const HandshakeSession = struct {
         return .completed;
     }
 
-    pub fn Error(self: *Self) SessionState {
+    pub fn Error(self: *Self) State {
         _ = self;
         return .failed;
     }

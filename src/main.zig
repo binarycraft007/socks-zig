@@ -26,6 +26,6 @@ pub fn main() !void {
     defer server.deinit();
 
     try server.startServe(
-        .{ .addr = "127.0.0.1", .port = 10808 },
+        .{ .addr = "127.0.0.1", .port = 1081 },
     );
 }
