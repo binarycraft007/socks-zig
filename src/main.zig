@@ -6,6 +6,10 @@ const builtin = @import("builtin");
 const Server = @import("Server.zig");
 
 pub fn main() !void {
+    var buf: [1 << 22]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const allocator = fba.allocator();
+
     if (builtin.os.tag != .windows) {
         const act = os.Sigaction{
             .handler = .{ .handler = os.SIG.IGN },
@@ -18,10 +22,10 @@ pub fn main() !void {
     var io = try IO.init(32, 0);
     defer io.deinit();
 
-    var server = Server.init(io);
+    var server = Server.init(allocator, io);
     defer server.deinit();
 
     try server.startServe(
-        .{ .addr = "127.0.0.1", .port = 1081 },
+        .{ .addr = "127.0.0.1", .port = 10808 },
     );
 }
