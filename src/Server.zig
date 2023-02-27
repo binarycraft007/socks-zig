@@ -369,7 +369,6 @@ const HandshakeSession = struct {
                     return .closed;
                 };
 
-                self.state_fn = onFinish;
                 self.remote_fd = os.socket(
                     self.address.any.family,
                     os.SOCK.STREAM,
@@ -378,6 +377,7 @@ const HandshakeSession = struct {
                     log.err("{s}", .{@errorName(err)});
                     return .closed;
                 };
+                self.state_fn = onFinish;
                 self.connectToAddress();
             },
             .domain_name => {
@@ -399,7 +399,7 @@ const HandshakeSession = struct {
                 log.info("name: {s}", .{name});
                 log.info("port: {d}", .{port});
 
-                const remote = net.tcpConnectToHost(
+                const list = net.getAddressList(
                     self.parent.gpa,
                     name,
                     port,
@@ -407,7 +407,25 @@ const HandshakeSession = struct {
                     log.err("{s}", .{@errorName(err)});
                     return .closed;
                 };
-                self.remote_fd = remote.handle;
+                defer list.deinit();
+
+                if (list.addrs.len == 0)
+                    log.err("UnknownHostName", .{});
+
+                for (list.addrs) |addr| {
+                    self.address = addr;
+                    self.remote_fd = os.socket(
+                        self.address.any.family,
+                        os.SOCK.STREAM,
+                        os.IPPROTO.TCP,
+                    ) catch |err| {
+                        log.err("{s}", .{@errorName(err)});
+                        return .closed;
+                    };
+
+                    self.state_fn = onFinish;
+                    self.connectToAddress();
+                }
             },
             .ipv6_addr => {
                 var buf: [39]u8 = undefined;
