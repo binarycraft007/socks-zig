@@ -167,21 +167,22 @@ const HandshakeSession = struct {
             return;
         };
 
-        var read = ctx.handshake.buffer[0..len];
-        ctx.handshake.read_buf.writeSlice(read) catch |err| {
+        var ses = &ctx.handshake;
+        var read = ses.buffer[0..len];
+        ses.read_buf.writeSlice(read) catch |err| {
             log.err("{s}", .{@errorName(err)});
             return;
         };
 
-        switch (ctx.handshake.state_fn(&ctx.handshake)) {
+        switch (ses.state_fn(ses)) {
             .need_more => {
-                if (ctx.handshake.write_buf.isEmpty())
-                    ctx.handshake.recvFromClient();
+                if (ses.write_buf.isEmpty())
+                    ses.recvFromClient();
             },
-            .closed => ctx.handshake.deinit(),
+            .closed => ses.deinit(),
             .completed => {
-                if (!ctx.handshake.read_buf.isEmpty())
-                    ctx.handshake.deinit();
+                if (!ses.read_buf.isEmpty())
+                    ses.deinit();
             },
         }
     }
@@ -207,12 +208,12 @@ const HandshakeSession = struct {
     ) void {
         _ = completion;
         log.info("send to client", .{});
-        var ses = ctx.handshake;
         var len = result catch |err| {
             log.err("{s}", .{@errorName(err)});
             return;
         };
 
+        var ses = &ctx.handshake;
         for (0..len) |_|
             _ = ses.write_buf.read().?;
 
@@ -274,14 +275,20 @@ const HandshakeSession = struct {
             return .need_more;
 
         if (self.read_buf.read().? != 0x05) {
-            log.err("only version 5 is supported", .{});
+            log.err("protocol not supported", .{});
             return .closed;
         }
 
-        var cmd = @intToEnum(Command, self.read_buf.read().?);
-        if (cmd != .connect) {
-            log.err("command not supported", .{});
-            //return .closed;
+        var command = self.read_buf.read().?;
+        switch (@intToEnum(Command, command)) {
+            .connect => {},
+            else => |cmd| {
+                log.err(
+                    "command: {s} not supported",
+                    .{@tagName(cmd)},
+                );
+                return .closed;
+            },
         }
 
         std.debug.assert(self.read_buf.read().? == 0);
@@ -310,7 +317,11 @@ const HandshakeSession = struct {
                 log.info("addr: {s}", .{addr});
                 log.info("port: {d}", .{port});
             },
-            .domain_name => {},
+            .domain_name => {
+                var name_len = self.read_buf.read().?;
+                if (self.read_buf.len() < name_len)
+                    return .need_more;
+            },
             .ipv6_addr => {
                 var buf: [39]u8 = undefined;
 
