@@ -14,10 +14,11 @@ const Server = @This();
 const Context = Server;
 
 io: IO,
-allocator: mem.Allocator,
+gpa: mem.Allocator,
 client_fd: os.socket_t = undefined,
 accp_compl: IO.Completion = undefined,
 server_fd: os.socket_t = undefined,
+handshake: HandshakeSession = undefined,
 
 const ListenOptions = struct {
     addr: []const u8,
@@ -25,7 +26,7 @@ const ListenOptions = struct {
 };
 
 pub fn init(allocator: mem.Allocator, io: IO) Server {
-    return Server{ .io = io, .allocator = allocator };
+    return Server{ .io = io, .gpa = allocator };
 }
 
 pub fn deinit(self: *Server) void {
@@ -82,16 +83,14 @@ fn onAcceptConnection(
 
     log.info("accepted client: {}", .{self.client_fd});
 
-    var handshake = HandshakeSession.init(.{
-        .gpa = self.allocator,
-        .io = self.io,
-        .client_fd = self.client_fd,
+    self.handshake = HandshakeSession.init(.{
+        .parent = self,
     }) catch |err| {
         log.err("{s}", .{@errorName(err)});
         return;
     };
     log.info("handshake session init done", .{});
-    handshake.recvFromClient();
+    self.handshake.recvFromClient();
     self.acceptConnection();
 }
 
@@ -101,57 +100,63 @@ const HandshakeSession = struct {
     const State = enum {
         completed,
         need_more,
-        failed,
+        closed,
     };
 
     const SessionInitOptions = struct {
-        gpa: mem.Allocator,
-        io: IO,
-        client_fd: os.socket_t,
+        parent: *Context,
     };
 
-    io: IO,
-    gpa: mem.Allocator,
+    const AddressType = enum(u8) {
+        ipv4_addr = 0x01,
+        domain_name = 0x03,
+        ipv6_addr = 0x04,
+    };
+
+    const Command = enum(u8) {
+        connect = 0x01,
+        bind = 0x02,
+        associate = 0x03,
+    };
+
     state_fn: *const fn (self: *Self) State,
-    client_fd: os.socket_t,
+    parent: *Context,
     remote_fd: os.socket_t = undefined,
     recv_compl: IO.Completion = undefined,
     send_compl: IO.Completion = undefined,
     conn_compl: IO.Completion = undefined,
-    buffer: [1024]u8 = undefined,
+    buffer: [1 << 14]u8 = undefined,
     read_buf: RingBuffer = undefined,
     write_buf: RingBuffer = undefined,
 
     pub fn init(opts: SessionInitOptions) !Self {
         return Self{
-            .gpa = opts.gpa,
-            .io = opts.io,
-            .state_fn = Greet,
-            .client_fd = opts.client_fd,
+            .state_fn = onGreet,
             .read_buf = try RingBuffer.init(
-                opts.gpa,
+                opts.parent.gpa,
                 1 << 14,
             ),
             .write_buf = try RingBuffer.init(
-                opts.gpa,
+                opts.parent.gpa,
                 1 << 14,
             ),
+            .parent = opts.parent,
         };
     }
 
     pub fn recvFromClient(self: *Self) void {
-        self.io.recv(
-            *Self,
-            self,
+        self.parent.io.recv(
+            *Context,
+            self.parent,
             onRecvFromClient,
             &self.recv_compl,
-            self.client_fd,
+            self.parent.client_fd,
             &self.buffer,
         );
     }
 
     pub fn onRecvFromClient(
-        self: *Self,
+        ctx: *Context,
         completion: *IO.Completion,
         result: IO.RecvError!usize,
     ) void {
@@ -159,59 +164,200 @@ const HandshakeSession = struct {
         log.info("recv from client", .{});
         var len = result catch |err| {
             log.err("{s}", .{@errorName(err)});
-            self.deinit();
-            return;
-        };
-        var read = self.buffer[0..len];
-        self.read_buf.writeSlice(read) catch |err| {
-            log.err("{s}", .{@errorName(err)});
-            self.deinit();
             return;
         };
 
-        switch (self.state_fn(self)) {
+        var read = ctx.handshake.buffer[0..len];
+        ctx.handshake.read_buf.writeSlice(read) catch |err| {
+            log.err("{s}", .{@errorName(err)});
+            return;
+        };
+
+        switch (ctx.handshake.state_fn(&ctx.handshake)) {
             .need_more => {
-                self.recvFromClient();
+                if (ctx.handshake.write_buf.isEmpty())
+                    ctx.handshake.recvFromClient();
             },
-            .failed => {},
-            .completed => {},
+            .closed => ctx.handshake.deinit(),
+            .completed => {
+                if (!ctx.handshake.read_buf.isEmpty())
+                    ctx.handshake.deinit();
+            },
         }
     }
 
-    pub fn Greet(self: *Self) State {
+    pub fn sendToClient(self: *Self) void {
+        self.parent.io.send(
+            *Context,
+            self.parent,
+            onSendToClient,
+            &self.send_compl,
+            self.parent.client_fd,
+            self.write_buf.sliceAt(
+                0,
+                self.write_buf.write_index,
+            ).first,
+        );
+    }
+
+    pub fn onSendToClient(
+        ctx: *Context,
+        completion: *IO.Completion,
+        result: IO.SendError!usize,
+    ) void {
+        _ = completion;
+        log.info("send to client", .{});
+        var ses = ctx.handshake;
+        var len = result catch |err| {
+            log.err("{s}", .{@errorName(err)});
+            return;
+        };
+
+        for (0..len) |_|
+            _ = ses.write_buf.read().?;
+
+        if (ses.write_buf.isEmpty()) {
+            ses.recvFromClient();
+        } else {
+            ses.sendToClient();
+        }
+    }
+
+    pub fn onGreet(self: *Self) State {
         log.info("socks start greeting", .{});
-        var needed_len = self.read_buf.data[1] + 2;
-        if (self.read_buf.read_index < needed_len) {
+        if (self.read_buf.len() < 2) {
             return .need_more;
         }
 
-        var version = self.read_buf.data[0];
+        var version = self.read_buf.read().?;
+        var nmethods = self.read_buf.read().?;
 
         log.info("socks version: {d}", .{version});
-        if (version != 0x05) {}
+        if (version != 0x05) {
+            log.err("only version 5 is supported", .{});
+            return .completed;
+        }
 
-        var nmethods = self.read_buf.data[1];
-        var methods = self.read_buf.data[2..nmethods];
+        if (self.read_buf.len() < nmethods)
+            return .need_more;
 
         var method_supported = false;
-        for (methods) |method| {
-            if (method == 0x00) {
+        for (0..nmethods) |_| {
+            if (self.read_buf.read().? == 0x00) {
                 method_supported = true;
-                break;
+                log.info("selected auth: 0x00", .{});
             }
         }
+
+        if (!method_supported) {
+            log.err("no auth method is supported", .{});
+            return .completed;
+        }
+
+        if (self.write_buf.isEmpty()) {
+            var reply = [_]u8{ version, 0x00 };
+            self.write_buf.writeSlice(&reply) catch |err| {
+                log.err("{s}", .{@errorName(err)});
+                return .completed;
+            };
+            self.sendToClient();
+            log.info("handshake auth success", .{});
+        }
+
+        self.state_fn = onRequest;
+
         return .completed;
     }
 
-    pub fn Error(self: *Self) State {
-        _ = self;
-        return .failed;
+    pub fn onRequest(self: *Self) State {
+        if (self.read_buf.len() < 4)
+            return .need_more;
+
+        if (self.read_buf.read().? != 0x05) {
+            log.err("only version 5 is supported", .{});
+            return .closed;
+        }
+
+        var cmd = @intToEnum(Command, self.read_buf.read().?);
+        if (cmd != .connect) {
+            log.err("command not supported", .{});
+            //return .closed;
+        }
+
+        std.debug.assert(self.read_buf.read().? == 0);
+
+        const addr_type = self.read_buf.read().?;
+        switch (@intToEnum(AddressType, addr_type)) {
+            .ipv4_addr => {
+                if (self.read_buf.len() < 6)
+                    return .need_more;
+
+                var buf: [15]u8 = undefined;
+                var addr = fmt.bufPrint(
+                    &buf,
+                    "{}.{}.{}.{}",
+                    .{
+                        self.read_buf.read().?,
+                        self.read_buf.read().?,
+                        self.read_buf.read().?,
+                        self.read_buf.read().?,
+                    },
+                ) catch unreachable;
+
+                var port_l: u16 = self.read_buf.read().?;
+                var port_h: u16 = self.read_buf.read().?;
+                var port = port_l << 8 | port_h;
+                log.info("addr: {s}", .{addr});
+                log.info("port: {d}", .{port});
+            },
+            .domain_name => {},
+            .ipv6_addr => {
+                var buf: [39]u8 = undefined;
+
+                if (self.read_buf.len() < 18)
+                    return .need_more;
+
+                var addr = fmt.bufPrint(
+                    &buf,
+                    "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:" ++
+                        "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:" ++
+                        "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:" ++
+                        "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}",
+                    .{
+                        self.read_buf.read().?,
+                        self.read_buf.read().?,
+                        self.read_buf.read().?,
+                        self.read_buf.read().?,
+                        self.read_buf.read().?,
+                        self.read_buf.read().?,
+                        self.read_buf.read().?,
+                        self.read_buf.read().?,
+                        self.read_buf.read().?,
+                        self.read_buf.read().?,
+                        self.read_buf.read().?,
+                        self.read_buf.read().?,
+                        self.read_buf.read().?,
+                        self.read_buf.read().?,
+                        self.read_buf.read().?,
+                        self.read_buf.read().?,
+                    },
+                ) catch unreachable;
+
+                var port_l: u16 = self.read_buf.read().?;
+                var port_h: u16 = self.read_buf.read().?;
+                var port = port_l << 8 | port_h;
+                log.info("addr: {s}", .{addr});
+                log.info("port: {d}", .{port});
+            },
+        }
+
+        return .closed;
     }
 
     pub fn deinit(self: *Self) void {
-        os.closeSocket(self.client_fd);
-        self.read_buf.deinit(self.gpa);
-        self.write_buf.deinit(self.gpa);
+        os.closeSocket(self.parent.client_fd);
+        self.read_buf.deinit(self.parent.gpa);
+        self.write_buf.deinit(self.parent.gpa);
     }
 };
 
@@ -600,22 +746,10 @@ const HandshakeSession = struct {
 //    log.info("send client len: {d}", .{len});
 //}
 
-pub const AddressType = enum(u8) {
-    ipv4_addr = 0x01,
-    domain_name = 0x03,
-    ipv6_addr = 0x04,
-};
-
-pub const Command = enum(u8) {
-    connect = 0x01,
-    bind = 0x02,
-    associate = 0x03,
-};
-
-pub const MetaData = struct {
-    command: Command,
-    address: DomainAddress,
-};
+//pub const MetaData = struct {
+//    command: Command,
+//    address: DomainAddress,
+//};
 
 const DomainAddress = struct {
     addr: ?net.Address,
