@@ -130,18 +130,22 @@ const HandshakeSession = struct {
 
     parent: *Context,
     state_fn: *const fn (self: *Self) State,
-    address: net.Address = undefined,
     remote_fd: os.socket_t = undefined,
     recv_compl: IO.Completion = undefined,
     send_compl: IO.Completion = undefined,
     conn_compl: IO.Completion = undefined,
     buffer: [1 << 14]u8 = undefined,
+    addr_buf: RingBuffer = undefined,
     read_buf: RingBuffer = undefined,
     write_buf: RingBuffer = undefined,
 
     pub fn init(opts: SessionInitOptions) !Self {
         return Self{
             .state_fn = onGreet,
+            .addr_buf = try RingBuffer.init(
+                opts.parent.gpa,
+                1 << 14,
+            ),
             .read_buf = try RingBuffer.init(
                 opts.parent.gpa,
                 1 << 14,
@@ -236,13 +240,37 @@ const HandshakeSession = struct {
     }
 
     pub fn connectToAddress(self: *Self) void {
+        const size = @sizeOf(net.Address);
+        var bytes: [size]u8 = undefined;
+
+        inline for (0..size) |i| {
+            bytes[i] = self.addr_buf.read().?;
+        }
+
+        const address = @bitCast(
+            net.Address,
+            bytes,
+        );
+
+        self.remote_fd = os.socket(
+            address.any.family,
+            os.SOCK.STREAM,
+            os.IPPROTO.TCP,
+        ) catch |err| {
+            log.err(
+                "{s}",
+                .{@errorName(err)},
+            );
+            return;
+        };
+
         self.parent.io.connect(
             *Context,
             self.parent,
             onConnectToAddress,
             &self.conn_compl,
             self.remote_fd,
-            self.address,
+            address,
         );
     }
 
@@ -252,13 +280,23 @@ const HandshakeSession = struct {
         result: IO.ConnectError!void,
     ) void {
         _ = completion;
+        var ses = &ctx.handshake;
+
         log.info("connect to addr", .{});
-        _ = result catch |err| {
-            log.err("{s}", .{@errorName(err)});
-            return;
+        _ = result catch |err| switch (err) {
+            error.ConnectionRefused => {
+                if (!ses.addr_buf.isEmpty()) {
+                    ses.connectToAddress();
+                } else {
+                    return;
+                }
+            },
+            else => {
+                log.err("{s}", .{@errorName(err)});
+                return;
+            },
         };
 
-        var ses = &ctx.handshake;
         var is_writing = !ses.write_buf.isEmpty();
         var reply = [_]u8{ 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
         ses.write_buf.writeSlice(&reply) catch |err| {
@@ -361,7 +399,7 @@ const HandshakeSession = struct {
                 log.info("addr: {s}", .{addr});
                 log.info("port: {d}", .{port});
 
-                self.address = net.Address.parseIp(
+                var address = net.Address.parseIp(
                     addr,
                     port,
                 ) catch |err| {
@@ -369,10 +407,8 @@ const HandshakeSession = struct {
                     return .closed;
                 };
 
-                self.remote_fd = os.socket(
-                    self.address.any.family,
-                    os.SOCK.STREAM,
-                    os.IPPROTO.TCP,
+                self.addr_buf.writeSlice(
+                    mem.asBytes(&address),
                 ) catch |err| {
                     log.err("{s}", .{@errorName(err)});
                     return .closed;
@@ -409,23 +445,21 @@ const HandshakeSession = struct {
                 };
                 defer list.deinit();
 
-                if (list.addrs.len == 0)
+                if (list.addrs.len == 0) {
                     log.err("UnknownHostName", .{});
+                    return .closed;
+                }
 
                 for (list.addrs) |addr| {
-                    self.address = addr;
-                    self.remote_fd = os.socket(
-                        self.address.any.family,
-                        os.SOCK.STREAM,
-                        os.IPPROTO.TCP,
+                    self.addr_buf.writeSlice(
+                        mem.asBytes(&addr),
                     ) catch |err| {
                         log.err("{s}", .{@errorName(err)});
                         return .closed;
                     };
-
-                    self.state_fn = onFinish;
-                    self.connectToAddress();
                 }
+                self.state_fn = onFinish;
+                self.connectToAddress();
             },
             .ipv6_addr => {
                 var buf: [39]u8 = undefined;
@@ -465,23 +499,19 @@ const HandshakeSession = struct {
                 log.info("addr: {s}", .{addr});
                 log.info("port: {d}", .{port});
 
-                self.address = net.Address.parseIp(
+                var address = net.Address.parseIp(
                     addr,
                     port,
                 ) catch |err| {
                     log.err("{s}", .{@errorName(err)});
                     return .closed;
                 };
-
-                self.remote_fd = os.socket(
-                    self.address.any.family,
-                    os.SOCK.STREAM,
-                    os.IPPROTO.TCP,
+                self.addr_buf.writeSlice(
+                    mem.asBytes(&address),
                 ) catch |err| {
                     log.err("{s}", .{@errorName(err)});
                     return .closed;
                 };
-
                 self.state_fn = onFinish;
                 self.connectToAddress();
             },
