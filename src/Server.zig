@@ -9,6 +9,7 @@ const mem = std.mem;
 const net = std.net;
 const meta = std.meta;
 const http = std.http;
+const assert = std.debug.assert;
 const windows = std.os.windows;
 const Server = @This();
 const Context = Server;
@@ -368,7 +369,7 @@ const HandshakeSession = struct {
             },
         }
 
-        std.debug.assert(self.read_buf.read().? == 0);
+        assert(self.read_buf.read().? == 0); // reserved
 
         const addr_type = self.read_buf.read().?;
         switch (@intToEnum(AddressType, addr_type)) {
@@ -516,16 +517,20 @@ const HandshakeSession = struct {
     }
 
     pub fn onFinish(self: *Self) State {
-        self.deinit();
         const parent = self.parent;
 
         parent.tunnel = TunnelSession.init(
-            .{ .parent = self.parent },
+            .{
+                .parent = self.parent,
+                .client_buf = self.read_buf,
+                .remote_buf = self.write_buf,
+            },
         ) catch |err| {
             log.err("{s}", .{@errorName(err)});
             return .closed;
         };
-        defer parent.tunnel.deinit();
+        self.deinit();
+        //defer parent.tunnel.deinit();
 
         parent.tunnel.client = Connection.init(.{
             .socket = parent.client_fd,
@@ -551,6 +556,8 @@ const HandshakeSession = struct {
             return .closed;
         };
 
+        parent.tunnel.start();
+
         return .closed;
     }
 
@@ -571,6 +578,9 @@ const Connection = struct {
     writable: bool,
     write_buf: RingBuffer,
     read_buf: RingBuffer,
+    recving: bool = false,
+    sending: bool = false,
+    buffer: [buf_size]u8 = undefined,
 
     const InitOptions = struct {
         socket: os.socket_t,
@@ -615,23 +625,200 @@ const TunnelSession = struct {
     remote: Connection = undefined,
     client_buf: RingBuffer = undefined,
     remote_buf: RingBuffer = undefined,
+    recv_compl: IO.Completion = undefined,
+    send_compl: IO.Completion = undefined,
 
     const InitOptions = struct {
         parent: *Context,
+        client_buf: RingBuffer,
+        remote_buf: RingBuffer,
+    };
+
+    const ShutdownMode = enum {
+        read_only,
+        write_only,
+        read_write,
     };
 
     pub fn init(opts: InitOptions) !Self {
         return Self{
             .parent = opts.parent,
-            .client_buf = try RingBuffer.init(
-                opts.parent.gpa,
-                buf_size,
-            ),
-            .remote_buf = try RingBuffer.init(
-                opts.parent.gpa,
-                buf_size,
-            ),
+            .client_buf = opts.client_buf,
+            .remote_buf = opts.remote_buf,
         };
+    }
+
+    pub fn start(self: *Self) void {
+        //if (!self.client_buf.isEmpty())
+        if (self.remote.write_buf.len() > 0)
+            self.sendTo(&self.remote);
+
+        //if (!self.client_buf.isFull())
+        if (self.client.read_buf.len() == 0)
+            self.recvFrom(&self.client);
+
+        //if (!self.remote_buf.isFull())
+        if (self.remote.read_buf.len() == 0)
+            self.recvFrom(&self.remote);
+    }
+
+    pub fn sendTo(
+        self: *Self,
+        conn: *Connection,
+    ) void {
+        assert(!conn.write_buf.isFull());
+        if (!conn.writable) return;
+
+        if (conn.write_buf.isEmpty())
+            conn.write_buf.writeSlice(
+                &conn.buffer,
+            ) catch |err| {
+                log.err("{s}", .{@errorName(err)});
+                return;
+            };
+
+        conn.sending = true;
+        self.parent.io.send(
+            *Context,
+            self.parent,
+            onSendTo,
+            &self.send_compl,
+            conn.socket,
+            conn.write_buf.sliceLast(
+                conn.write_buf.len(),
+            ).first,
+        );
+    }
+
+    pub fn onSendTo(
+        ctx: *Context,
+        completion: *IO.Completion,
+        result: IO.SendError!usize,
+    ) void {
+        _ = completion;
+        const ses = &ctx.tunnel;
+
+        var conn = if (ses.client.sending) blk: {
+            break :blk &ses.client;
+        } else blk: {
+            break :blk &ses.remote;
+        };
+
+        conn.sending = false;
+
+        var len = result catch |err| switch (err) {
+            error.BrokenPipe => {
+                ses.stop(conn.other, .read_only);
+                return;
+            },
+            else => {
+                log.err("{s}", .{@errorName(err)});
+                return;
+            },
+        };
+
+        const need_read = conn.write_buf.isFull();
+        for (0..len) |_| _ = conn.write_buf.read().?;
+
+        if (!conn.write_buf.isEmpty())
+            ses.sendTo(conn);
+
+        if (need_read) ses.recvFrom(conn.other);
+    }
+
+    pub fn recvFrom(
+        self: *Self,
+        conn: *Connection,
+    ) void {
+        assert(!conn.read_buf.isFull());
+
+        if (!conn.readable) return;
+
+        log.info("tunnel recv from", .{});
+        conn.recving = true;
+        self.parent.io.recv(
+            *Context,
+            self.parent,
+            onRecvFrom,
+            &self.recv_compl,
+            conn.socket,
+            &conn.buffer,
+        );
+    }
+
+    pub fn onRecvFrom(
+        ctx: *Context,
+        completion: *IO.Completion,
+        result: IO.RecvError!usize,
+    ) void {
+        _ = completion;
+        const ses = &ctx.tunnel;
+
+        var conn = if (ses.client.recving) blk: {
+            log.info("tunnel recv from client", .{});
+            break :blk &ses.client;
+        } else blk: {
+            log.info("tunnel recv from remote", .{});
+            break :blk &ses.remote;
+        };
+
+        conn.recving = false;
+
+        var len = result catch |err| {
+            log.err("{s}", .{@errorName(err)});
+            return;
+        };
+
+        if (len == 0) conn.readable = false;
+
+        const buf = conn.buffer[0..len];
+        if (len != 0)
+            conn.read_buf.writeSlice(buf) catch |err| {
+                log.err("{s}", .{@errorName(err)});
+                return;
+            };
+
+        var need_write = conn.read_buf.isEmpty();
+        for (0..len) |_| _ = conn.read_buf.read().?;
+
+        if (need_write) {
+            if (len == 0) {
+                ses.stop(conn.other, .write_only);
+            } else {
+                ses.sendTo(conn.other);
+            }
+        }
+
+        if (!conn.read_buf.isFull())
+            ses.recvFrom(conn);
+    }
+
+    pub fn stop(
+        self: *Self,
+        conn: *Connection,
+        mode: ShutdownMode,
+    ) void {
+        _ = self;
+        //defer conn.deinit();
+        switch (mode) {
+            .read_only => {
+                if (!conn.readable)
+                    return;
+                conn.readable = false;
+            },
+            .write_only => {
+                if (!conn.writable)
+                    return;
+                conn.writable = false;
+            },
+            .read_write => {
+                if (!conn.readable and
+                    !conn.writable)
+                    return;
+                conn.readable = false;
+                conn.writable = false;
+            },
+        }
     }
 
     pub fn deinit(self: *Self) void {
