@@ -13,12 +13,15 @@ const windows = std.os.windows;
 const Server = @This();
 const Context = Server;
 
+const buf_size = 1024;
+
 io: IO,
 gpa: mem.Allocator,
 client_fd: os.socket_t = undefined,
 accp_compl: IO.Completion = undefined,
 server_fd: os.socket_t = undefined,
 handshake: HandshakeSession = undefined,
+tunnel: TunnelSession = undefined,
 
 const ListenOptions = struct {
     addr: []const u8,
@@ -34,20 +37,12 @@ pub fn deinit(self: *Server) void {
 }
 
 pub fn startServe(self: *Server, opts: ListenOptions) !void {
-    // Setup the server socket
-    const is_windows = builtin.target.os.tag == .windows;
-
-    const sock_flag = if (is_windows) blk: {
-        break :blk os.SOCK.STREAM | 0;
-    } else blk: {
-        break :blk os.SOCK.STREAM | os.SOCK.CLOEXEC;
-    };
-
-    self.server_fd = try os.socket(
+    self.server_fd = try self.io.open_socket(
         os.AF.INET,
-        sock_flag,
+        os.SOCK.STREAM,
         os.IPPROTO.TCP,
     );
+
     try os.setsockopt(
         self.server_fd,
         os.SOL.SOCKET,
@@ -112,7 +107,7 @@ const HandshakeSession = struct {
         err_state,
     };
 
-    const SessionInitOptions = struct {
+    const InitOptions = struct {
         parent: *Context,
     };
 
@@ -134,25 +129,25 @@ const HandshakeSession = struct {
     recv_compl: IO.Completion = undefined,
     send_compl: IO.Completion = undefined,
     conn_compl: IO.Completion = undefined,
-    buffer: [1 << 14]u8 = undefined,
+    buffer: [buf_size]u8 = undefined,
     addr_buf: RingBuffer = undefined,
     read_buf: RingBuffer = undefined,
     write_buf: RingBuffer = undefined,
 
-    pub fn init(opts: SessionInitOptions) !Self {
+    pub fn init(opts: InitOptions) !Self {
         return Self{
             .state_fn = onGreet,
             .addr_buf = try RingBuffer.init(
                 opts.parent.gpa,
-                1 << 14,
+                buf_size,
             ),
             .read_buf = try RingBuffer.init(
                 opts.parent.gpa,
-                1 << 14,
+                buf_size,
             ),
             .write_buf = try RingBuffer.init(
                 opts.parent.gpa,
-                1 << 14,
+                buf_size,
             ),
             .parent = opts.parent,
         };
@@ -252,7 +247,7 @@ const HandshakeSession = struct {
             bytes,
         );
 
-        self.remote_fd = os.socket(
+        self.remote_fd = self.parent.io.open_socket(
             address.any.family,
             os.SOCK.STREAM,
             os.IPPROTO.TCP,
@@ -521,409 +516,128 @@ const HandshakeSession = struct {
     }
 
     pub fn onFinish(self: *Self) State {
-        _ = self;
+        self.deinit();
+        const parent = self.parent;
+
+        parent.tunnel = TunnelSession.init(
+            .{ .parent = self.parent },
+        ) catch |err| {
+            log.err("{s}", .{@errorName(err)});
+            return .closed;
+        };
+        defer parent.tunnel.deinit();
+
+        parent.tunnel.client = Connection.init(.{
+            .socket = parent.client_fd,
+            .owner = &parent.tunnel,
+            .other = &parent.tunnel.remote,
+            .is_client = true,
+            .readable = true,
+            .writable = true,
+        }) catch |err| {
+            log.err("{s}", .{@errorName(err)});
+            return .closed;
+        };
+
+        parent.tunnel.remote = Connection.init(.{
+            .socket = self.remote_fd,
+            .owner = &parent.tunnel,
+            .other = &parent.tunnel.client,
+            .is_client = false,
+            .readable = true,
+            .writable = true,
+        }) catch |err| {
+            log.err("{s}", .{@errorName(err)});
+            return .closed;
+        };
+
         return .closed;
     }
 
     pub fn deinit(self: *Self) void {
-        os.closeSocket(self.remote_fd);
-        os.closeSocket(self.parent.client_fd);
         self.read_buf.deinit(self.parent.gpa);
         self.write_buf.deinit(self.parent.gpa);
     }
 };
 
-//fn recvVersion(
-//    self: *Context,
-//    completion: *IO.Completion,
-//) void {
-//    log.info("read version", .{});
-//    self.io.recv(
-//        *Context,
-//        self,
-//        onRecvVersion,
-//        completion,
-//        self.client_fd,
-//        self.buffer[0..2],
-//    );
-//}
-//
-//fn onRecvVersion(
-//    self: *Context,
-//    completion: *IO.Completion,
-//    result: IO.RecvError!usize,
-//) void {
-//    _ = completion;
-//    _ = result catch |err| @panic(@errorName(err));
-//    log.info("socks version: {d}", .{self.buffer[0]});
-//    log.info("num of method: {d}", .{self.buffer[1]});
-//    self.recvMethods(
-//        &self.recv_compl,
-//        self.buffer[1],
-//    );
-//}
-//
-//fn recvMethods(
-//    self: *Context,
-//    completion: *IO.Completion,
-//    num: usize,
-//) void {
-//    self.io.recv(
-//        *Context,
-//        self,
-//        onRecvMethods,
-//        completion,
-//        self.client_fd,
-//        self.buffer[0..num],
-//    );
-//}
-//
-//fn onRecvMethods(
-//    self: *Context,
-//    completion: *IO.Completion,
-//    result: IO.RecvError!usize,
-//) void {
-//    _ = completion;
-//    _ = result catch |err| @panic(@errorName(err));
-//    self.sendMethods(
-//        &self.send_compl,
-//    );
-//}
-//
-//fn sendMethods(
-//    self: *Context,
-//    completion: *IO.Completion,
-//) void {
-//    self.io.send(
-//        *Context,
-//        self,
-//        onSendMethods,
-//        completion,
-//        self.client_fd,
-//        &[_]u8{ 5, 0 },
-//    );
-//}
-//
-//fn onSendMethods(
-//    self: *Context,
-//    completion: *IO.Completion,
-//    result: IO.SendError!usize,
-//) void {
-//    _ = completion;
-//    _ = result catch @panic("send error");
-//
-//    self.recvCommand(&self.recv_compl);
-//}
-//
-//fn recvCommand(
-//    self: *Context,
-//    completion: *IO.Completion,
-//) void {
-//    self.io.recv(
-//        *Context,
-//        self,
-//        onRecvCommand,
-//        completion,
-//        self.client_fd,
-//        self.buffer[0..4],
-//    );
-//}
-//
-//fn onRecvCommand(
-//    self: *Context,
-//    completion: *IO.Completion,
-//    result: IO.RecvError!usize,
-//) void {
-//    _ = completion;
-//    _ = result catch @panic("recv error");
-//    self.command = @intToEnum(Command, self.buffer[1]);
-//    self.addr_type = @intToEnum(AddressType, self.buffer[3]);
-//    log.info("recv cmd: {s}", .{@tagName(self.command)});
-//    log.info("recv addr: {s}", .{@tagName(self.addr_type)});
-//
-//    switch (self.command) {
-//        .connect => {
-//            switch (self.addr_type) {
-//                .ipv4_addr => {
-//                    self.recvIpv4Addr(&self.recv_compl);
-//                },
-//                .domain_name => {
-//                    // TODO
-//                },
-//                .ipv6_addr => {
-//                    // TODO
-//                },
-//            }
-//        },
-//        .associate => {
-//            // TODO
-//        },
-//        .bind => {
-//            // TODO
-//        },
-//    }
-//}
-//
-//fn recvIpv4Addr(
-//    self: *Context,
-//    completion: *IO.Completion,
-//) void {
-//    self.io.recv(
-//        *Context,
-//        self,
-//        onRecvIpv4Addr,
-//        completion,
-//        self.client_fd,
-//        self.buffer[0..4],
-//    );
-//}
-//
-//fn onRecvIpv4Addr(
-//    self: *Context,
-//    completion: *IO.Completion,
-//    result: IO.RecvError!usize,
-//) void {
-//    _ = completion;
-//    _ = result catch @panic("recv error");
-//    self.addr = fmt.bufPrint(
-//        self.buffer[4 .. 4 + 15],
-//        "{}.{}.{}.{}",
-//        .{
-//            self.buffer[0],
-//            self.buffer[1],
-//            self.buffer[2],
-//            self.buffer[3],
-//        },
-//    ) catch |err| @panic(@errorName(err));
-//    self.recvPortNumber(&self.recv_compl);
-//}
-//
-//fn recvPortNumber(
-//    self: *Context,
-//    completion: *IO.Completion,
-//) void {
-//    self.io.recv(
-//        *Context,
-//        self,
-//        onRecvPortNumber,
-//        completion,
-//        self.client_fd,
-//        self.buffer[0..2],
-//    );
-//}
-//
-//fn onRecvPortNumber(
-//    self: *Context,
-//    completion: *IO.Completion,
-//    result: IO.RecvError!usize,
-//) void {
-//    _ = completion;
-//    _ = result catch @panic("recv error");
-//    self.port = @as(u16, self.buffer[0]) <<
-//        8 | self.buffer[1];
-//    var address = net.Address.parseIp(
-//        self.addr,
-//        self.port,
-//    ) catch |err| @panic(@errorName(err));
-//    log.debug("addr: {s}", .{self.addr});
-//    log.debug("port: {d}", .{self.port});
-//    self.connectToRemote(&self.conn_compl, address);
-//}
-//
-//fn connectToRemote(
-//    self: *Context,
-//    completion: *IO.Completion,
-//    address: net.Address,
-//) void {
-//    self.remote_fd = os.socket(
-//        address.any.family,
-//        os.SOCK.STREAM,
-//        os.IPPROTO.TCP,
-//    ) catch |err| @panic(@errorName(err));
-//
-//    log.info("connect to: {}", .{address});
-//    self.io.connect(
-//        *Context,
-//        self,
-//        onConnectToRemote,
-//        completion,
-//        self.remote_fd,
-//        address,
-//    );
-//}
-//
-//fn onConnectToRemote(
-//    self: *Context,
-//    completion: *IO.Completion,
-//    result: IO.ConnectError!void,
-//) void {
-//    _ = completion;
-//    _ = result catch |err| @panic(@errorName(err));
-//    self.sendReplyMsg(&self.send_compl);
-//}
-//
-//fn sendReplyMsg(
-//    self: *Context,
-//    completion: *IO.Completion,
-//) void {
-//    self.io.send(
-//        *Context,
-//        self,
-//        onSendReplyMsg,
-//        completion,
-//        self.client_fd,
-//        &[_]u8{ 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 },
-//    );
-//}
-//
-//fn onSendReplyMsg(
-//    self: *Context,
-//    completion: *IO.Completion,
-//    result: IO.SendError!usize,
-//) void {
-//    _ = completion;
-//    _ = result catch @panic("recv error");
-//
-//    os.closeSocket(self.client_fd);
-//    os.closeSocket(self.remote_fd);
-//    //self.recvClientReq(
-//    //    self.compl_list.popFirst().?.data,
-//    //);
-//}
-//
-//fn recvClientReq(
-//    self: *Context,
-//    completion: *IO.Completion,
-//) void {
-//    _ = completion;
-//    self.io.recv(
-//        *Context,
-//        self,
-//        onRecvClientReq,
-//        self.compl_list.popFirst().?.data,
-//        self.client_fd,
-//        &self.buffer,
-//    );
-//}
-//
-//fn onRecvClientReq(
-//    self: *Context,
-//    completion: *IO.Completion,
-//    result: IO.RecvError!usize,
-//) void {
-//    _ = completion;
-//    var len = result catch @panic("recv error");
-//    log.info("recv client len: {d}", .{len});
-//    self.sendReqRemote(
-//        self.compl_list.popFirst().?.data,
-//        len,
-//    );
-//
-//    if (len != 0) {
-//        self.recvClientReq(
-//            self.compl_list.popFirst().?.data,
-//        );
-//    }
-//}
-//
-//fn sendReqRemote(
-//    self: *Context,
-//    completion: *IO.Completion,
-//    msg_len: usize,
-//) void {
-//    _ = completion;
-//    self.io.send(
-//        *Context,
-//        self,
-//        onSendReqRemote,
-//        &self.compls[22],
-//        self.remote.handle,
-//        self.buffer[0..msg_len],
-//    );
-//}
-//
-//fn onSendReqRemote(
-//    self: *Context,
-//    completion: *IO.Completion,
-//    result: IO.SendError!usize,
-//) void {
-//    _ = completion;
-//    var len = result catch @panic("recv error");
-//    log.info("send remote len: {d}", .{len});
-//    self.recvRemoteRsp(
-//        self.compl_list.popFirst().?.data,
-//    );
-//}
-//
-//fn recvRemoteRsp(
-//    self: *Context,
-//    completion: *IO.Completion,
-//) void {
-//    _ = completion;
-//    self.io.recv(
-//        *Context,
-//        self,
-//        onRecvRemoteRsp,
-//        self.compl_list.popFirst().?.data,
-//        self.remote.handle,
-//        &self.buffer,
-//    );
-//}
-//
-//fn onRecvRemoteRsp(
-//    self: *Context,
-//    completion: *IO.Completion,
-//    result: IO.RecvError!usize,
-//) void {
-//    _ = completion;
-//    var len = result catch @panic("recv error");
-//    log.info("recv remote len: {d}", .{len});
-//    self.recv_len += len;
-//    self.sendRspClient(
-//        self.compl_list.popFirst().?.data,
-//        len,
-//    );
-//
-//    if (len != 0) {
-//        self.recvRemoteRsp(
-//            self.compl_list.popFirst().?.data,
-//        );
-//    }
-//}
-//
-//fn sendRspClient(
-//    self: *Context,
-//    completion: *IO.Completion,
-//    msg_len: usize,
-//) void {
-//    _ = completion;
-//    self.io.send(
-//        *Context,
-//        self,
-//        onSendRspClient,
-//        self.compl_list.popFirst().?.data,
-//        self.client.handle,
-//        self.buffer[0..msg_len],
-//    );
-//}
-//
-//fn onSendRspClient(
-//    self: *Context,
-//    completion: *IO.Completion,
-//    result: IO.SendError!usize,
-//) void {
-//    _ = completion;
-//    var len = result catch |err| @panic(@errorName(err));
-//    self.send_len += len;
-//    log.info("send client len: {d}", .{len});
-//}
+const Connection = struct {
+    const Self = @This();
 
-//pub const MetaData = struct {
-//    command: Command,
-//    address: DomainAddress,
-//};
+    socket: os.socket_t,
+    owner: *TunnelSession,
+    other: *Connection,
+    is_client: bool,
+    readable: bool,
+    writable: bool,
+    write_buf: RingBuffer,
+    read_buf: RingBuffer,
 
-const DomainAddress = struct {
-    addr: ?net.Address,
-    name: ?[]const u8,
+    const InitOptions = struct {
+        socket: os.socket_t,
+        owner: *TunnelSession,
+        other: *Connection,
+        is_client: bool,
+        readable: bool,
+        writable: bool,
+    };
+
+    pub fn init(opts: InitOptions) !Self {
+        return Self{
+            .socket = opts.socket,
+            .owner = opts.owner,
+            .other = opts.other,
+            .is_client = opts.is_client,
+            .readable = opts.readable,
+            .writable = opts.writable,
+            .write_buf = try RingBuffer.init(
+                opts.owner.parent.gpa,
+                buf_size,
+            ),
+            .read_buf = try RingBuffer.init(
+                opts.owner.parent.gpa,
+                buf_size,
+            ),
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        os.closeSocket(self.socket);
+        self.write_buf.deinit(self.owner.parent.gpa);
+        self.read_buf.deinit(self.owner.parent.gpa);
+    }
+};
+
+const TunnelSession = struct {
+    const Self = @This();
+
+    parent: *Context,
+    client: Connection = undefined,
+    remote: Connection = undefined,
+    client_buf: RingBuffer = undefined,
+    remote_buf: RingBuffer = undefined,
+
+    const InitOptions = struct {
+        parent: *Context,
+    };
+
+    pub fn init(opts: InitOptions) !Self {
+        return Self{
+            .parent = opts.parent,
+            .client_buf = try RingBuffer.init(
+                opts.parent.gpa,
+                buf_size,
+            ),
+            .remote_buf = try RingBuffer.init(
+                opts.parent.gpa,
+                buf_size,
+            ),
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.client.deinit();
+        self.remote.deinit();
+        self.client_buf.deinit(self.parent.gpa);
+        self.remote_buf.deinit(self.parent.gpa);
+    }
 };
