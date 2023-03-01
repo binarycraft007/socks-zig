@@ -18,9 +18,10 @@ const buf_size = 1024;
 
 io: IO,
 gpa: mem.Allocator,
-client_fd: os.socket_t = undefined,
 accp_compl: IO.Completion = undefined,
 server_fd: os.socket_t = undefined,
+client_fd: os.socket_t = undefined,
+remote_fd: os.socket_t = undefined,
 handshake: HandshakeSession = undefined,
 tunnel: TunnelSession = undefined,
 
@@ -125,8 +126,8 @@ const HandshakeSession = struct {
     };
 
     parent: *Context,
+    remote_connected: bool = false,
     state_fn: *const fn (self: *Self) State,
-    remote_fd: os.socket_t = undefined,
     recv_compl: IO.Completion = undefined,
     send_compl: IO.Completion = undefined,
     conn_compl: IO.Completion = undefined,
@@ -229,7 +230,11 @@ const HandshakeSession = struct {
             _ = ses.write_buf.read().?;
 
         if (ses.write_buf.isEmpty()) {
-            ses.recvFromClient();
+            if (!ses.remote_connected) {
+                ses.recvFromClient();
+            } else {
+                ses.setupTunnel();
+            }
         } else {
             ses.sendToClient();
         }
@@ -248,7 +253,7 @@ const HandshakeSession = struct {
             bytes,
         );
 
-        self.remote_fd = self.parent.io.open_socket(
+        self.parent.remote_fd = self.parent.io.open_socket(
             address.any.family,
             os.SOCK.STREAM,
             os.IPPROTO.TCP,
@@ -265,7 +270,7 @@ const HandshakeSession = struct {
             self.parent,
             onConnectToAddress,
             &self.conn_compl,
-            self.remote_fd,
+            self.parent.remote_fd,
             address,
         );
     }
@@ -293,6 +298,7 @@ const HandshakeSession = struct {
             },
         };
 
+        ses.remote_connected = true;
         var is_writing = !ses.write_buf.isEmpty();
         var reply = [_]u8{ 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
         ses.write_buf.writeSlice(&reply) catch |err| {
@@ -409,7 +415,7 @@ const HandshakeSession = struct {
                     log.err("{s}", .{@errorName(err)});
                     return .closed;
                 };
-                self.state_fn = onFinish;
+                //self.state_fn = onFinish;
                 self.connectToAddress();
             },
             .domain_name => {
@@ -454,7 +460,7 @@ const HandshakeSession = struct {
                         return .closed;
                     };
                 }
-                self.state_fn = onFinish;
+                //self.state_fn = onFinish;
                 self.connectToAddress();
             },
             .ipv6_addr => {
@@ -508,7 +514,7 @@ const HandshakeSession = struct {
                     log.err("{s}", .{@errorName(err)});
                     return .closed;
                 };
-                self.state_fn = onFinish;
+                //self.state_fn = onFinish;
                 self.connectToAddress();
             },
         }
@@ -516,7 +522,7 @@ const HandshakeSession = struct {
         return .closed;
     }
 
-    pub fn onFinish(self: *Self) State {
+    pub fn setupTunnel(self: *Self) void {
         self.deinit();
         const parent = self.parent;
 
@@ -526,7 +532,7 @@ const HandshakeSession = struct {
             },
         ) catch |err| {
             log.err("{s}", .{@errorName(err)});
-            return .closed;
+            return;
         };
         //defer parent.tunnel.deinit();
 
@@ -539,12 +545,12 @@ const HandshakeSession = struct {
             .writable = true,
         }) catch |err| {
             log.err("{s}", .{@errorName(err)});
-            return .closed;
+            return;
         };
         parent.tunnel.client = &client_conn;
 
         var remote_conn = Connection.init(.{
-            .socket = self.remote_fd,
+            .socket = parent.remote_fd,
             .owner = &parent.tunnel,
             .other = parent.tunnel.client,
             .is_client = false,
@@ -552,13 +558,11 @@ const HandshakeSession = struct {
             .writable = true,
         }) catch |err| {
             log.err("{s}", .{@errorName(err)});
-            return .closed;
+            return;
         };
         parent.tunnel.remote = &remote_conn;
 
         parent.tunnel.start();
-
-        return .closed;
     }
 
     pub fn deinit(self: *Self) void {
@@ -625,6 +629,7 @@ const TunnelSession = struct {
     recv_compl: IO.Completion = undefined,
     send_compl: IO.Completion = undefined,
     remote_recv_once: bool = false,
+    buffer: [buf_size]u8 = undefined,
 
     const InitOptions = struct {
         parent: *Context,
@@ -643,13 +648,14 @@ const TunnelSession = struct {
     pub fn sendToRemote(
         self: *Self,
     ) void {
+        log.info("tunnel send to remote", .{});
         const len = self.client.recv_len;
         self.parent.io.send(
             *Context,
             self.parent,
             onSendToRemote,
             &self.send_compl,
-            self.remote.socket,
+            self.parent.remote_fd,
             self.client.buffer[0..len],
         );
     }
@@ -659,12 +665,13 @@ const TunnelSession = struct {
         completion: *IO.Completion,
         result: IO.SendError!usize,
     ) void {
-        _ = ctx;
         _ = completion;
+        const ses = &ctx.tunnel;
         _ = result catch |err| {
             log.err("{s}", .{@errorName(err)});
             return;
         };
+        ses.recvFromClient();
     }
 
     pub fn recvFromClient(
@@ -718,7 +725,7 @@ const TunnelSession = struct {
             self.parent,
             onRecvFromClient,
             &self.recv_compl,
-            self.remote.socket,
+            self.parent.remote_fd,
             &self.remote.buffer,
         );
     }
@@ -749,6 +756,7 @@ const TunnelSession = struct {
     pub fn sendToClient(
         self: *Self,
     ) void {
+        log.info("tunnel send to client", .{});
         const len = self.remote.recv_len;
         self.parent.io.send(
             *Context,
