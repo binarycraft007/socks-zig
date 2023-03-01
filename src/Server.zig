@@ -517,25 +517,23 @@ const HandshakeSession = struct {
     }
 
     pub fn onFinish(self: *Self) State {
+        self.deinit();
         const parent = self.parent;
 
         parent.tunnel = TunnelSession.init(
             .{
                 .parent = self.parent,
-                .client_buf = self.read_buf,
-                .remote_buf = self.write_buf,
             },
         ) catch |err| {
             log.err("{s}", .{@errorName(err)});
             return .closed;
         };
-        self.deinit();
         //defer parent.tunnel.deinit();
 
-        parent.tunnel.client = Connection.init(.{
+        var client_conn = Connection.init(.{
             .socket = parent.client_fd,
             .owner = &parent.tunnel,
-            .other = &parent.tunnel.remote,
+            .other = parent.tunnel.remote,
             .is_client = true,
             .readable = true,
             .writable = true,
@@ -543,11 +541,12 @@ const HandshakeSession = struct {
             log.err("{s}", .{@errorName(err)});
             return .closed;
         };
+        parent.tunnel.client = &client_conn;
 
-        parent.tunnel.remote = Connection.init(.{
+        var remote_conn = Connection.init(.{
             .socket = self.remote_fd,
             .owner = &parent.tunnel,
-            .other = &parent.tunnel.client,
+            .other = parent.tunnel.client,
             .is_client = false,
             .readable = true,
             .writable = true,
@@ -555,6 +554,7 @@ const HandshakeSession = struct {
             log.err("{s}", .{@errorName(err)});
             return .closed;
         };
+        parent.tunnel.remote = &remote_conn;
 
         parent.tunnel.start();
 
@@ -578,8 +578,7 @@ const Connection = struct {
     writable: bool,
     write_buf: RingBuffer,
     read_buf: RingBuffer,
-    recving: bool = false,
-    sending: bool = false,
+    recv_len: usize = 0,
     buffer: [buf_size]u8 = undefined,
 
     const InitOptions = struct {
@@ -621,210 +620,161 @@ const TunnelSession = struct {
     const Self = @This();
 
     parent: *Context,
-    client: Connection = undefined,
-    remote: Connection = undefined,
-    client_buf: RingBuffer = undefined,
-    remote_buf: RingBuffer = undefined,
+    client: *Connection = undefined,
+    remote: *Connection = undefined,
     recv_compl: IO.Completion = undefined,
     send_compl: IO.Completion = undefined,
+    remote_recv_once: bool = false,
 
     const InitOptions = struct {
         parent: *Context,
-        client_buf: RingBuffer,
-        remote_buf: RingBuffer,
-    };
-
-    const ShutdownMode = enum {
-        read_only,
-        write_only,
-        read_write,
     };
 
     pub fn init(opts: InitOptions) !Self {
         return Self{
             .parent = opts.parent,
-            .client_buf = opts.client_buf,
-            .remote_buf = opts.remote_buf,
         };
     }
 
     pub fn start(self: *Self) void {
-        //if (!self.client_buf.isEmpty())
-        if (self.remote.write_buf.len() > 0)
-            self.sendTo(&self.remote);
-
-        //if (!self.client_buf.isFull())
-        if (self.client.read_buf.len() == 0)
-            self.recvFrom(&self.client);
-
-        //if (!self.remote_buf.isFull())
-        if (self.remote.read_buf.len() == 0)
-            self.recvFrom(&self.remote);
+        self.recvFromClient();
     }
 
-    pub fn sendTo(
+    pub fn sendToRemote(
         self: *Self,
-        conn: *Connection,
     ) void {
-        assert(!conn.write_buf.isFull());
-        if (!conn.writable) return;
-
-        if (conn.write_buf.isEmpty())
-            conn.write_buf.writeSlice(
-                &conn.buffer,
-            ) catch |err| {
-                log.err("{s}", .{@errorName(err)});
-                return;
-            };
-
-        conn.sending = true;
+        const len = self.client.recv_len;
         self.parent.io.send(
             *Context,
             self.parent,
-            onSendTo,
+            onSendToRemote,
             &self.send_compl,
-            conn.socket,
-            conn.write_buf.sliceLast(
-                conn.write_buf.len(),
-            ).first,
+            self.remote.socket,
+            self.client.buffer[0..len],
         );
     }
 
-    pub fn onSendTo(
+    pub fn onSendToRemote(
         ctx: *Context,
         completion: *IO.Completion,
         result: IO.SendError!usize,
     ) void {
+        _ = ctx;
         _ = completion;
-        const ses = &ctx.tunnel;
-
-        var conn = if (ses.client.sending) blk: {
-            break :blk &ses.client;
-        } else blk: {
-            break :blk &ses.remote;
+        _ = result catch |err| {
+            log.err("{s}", .{@errorName(err)});
+            return;
         };
-
-        conn.sending = false;
-
-        var len = result catch |err| switch (err) {
-            error.BrokenPipe => {
-                ses.stop(conn.other, .read_only);
-                return;
-            },
-            else => {
-                log.err("{s}", .{@errorName(err)});
-                return;
-            },
-        };
-
-        const need_read = conn.write_buf.isFull();
-        for (0..len) |_| _ = conn.write_buf.read().?;
-
-        if (!conn.write_buf.isEmpty())
-            ses.sendTo(conn);
-
-        if (need_read) ses.recvFrom(conn.other);
     }
 
-    pub fn recvFrom(
+    pub fn recvFromClient(
         self: *Self,
-        conn: *Connection,
     ) void {
-        assert(!conn.read_buf.isFull());
-
-        if (!conn.readable) return;
-
-        log.info("tunnel recv from", .{});
-        conn.recving = true;
+        log.info("tunnel recv from client", .{});
         self.parent.io.recv(
             *Context,
             self.parent,
-            onRecvFrom,
+            onRecvFromClient,
             &self.recv_compl,
-            conn.socket,
-            &conn.buffer,
+            self.client.socket,
+            &self.client.buffer,
         );
     }
 
-    pub fn onRecvFrom(
+    pub fn onRecvFromClient(
         ctx: *Context,
         completion: *IO.Completion,
         result: IO.RecvError!usize,
     ) void {
         _ = completion;
         const ses = &ctx.tunnel;
+        const conn = ses.client;
 
-        var conn = if (ses.client.recving) blk: {
-            log.info("tunnel recv from client", .{});
-            break :blk &ses.client;
-        } else blk: {
-            log.info("tunnel recv from remote", .{});
-            break :blk &ses.remote;
-        };
-
-        conn.recving = false;
-
-        var len = result catch |err| {
+        conn.recv_len = result catch |err| {
             log.err("{s}", .{@errorName(err)});
             return;
         };
 
-        if (len == 0) conn.readable = false;
+        log.info("{s}", .{conn.buffer[0..conn.recv_len]});
 
-        const buf = conn.buffer[0..len];
-        if (len != 0)
-            conn.read_buf.writeSlice(buf) catch |err| {
-                log.err("{s}", .{@errorName(err)});
-                return;
-            };
-
-        var need_write = conn.read_buf.isEmpty();
-        for (0..len) |_| _ = conn.read_buf.read().?;
-
-        if (need_write) {
-            if (len == 0) {
-                ses.stop(conn.other, .write_only);
+        if (conn.recv_len == 0) {
+            if (!ses.remote_recv_once) {
+                ses.recvFromRemote();
             } else {
-                ses.sendTo(conn.other);
+                ses.deinit();
             }
         }
 
-        if (!conn.read_buf.isFull())
-            ses.recvFrom(conn);
+        ses.sendToRemote();
     }
 
-    pub fn stop(
+    pub fn recvFromRemote(
         self: *Self,
-        conn: *Connection,
-        mode: ShutdownMode,
     ) void {
-        _ = self;
-        //defer conn.deinit();
-        switch (mode) {
-            .read_only => {
-                if (!conn.readable)
-                    return;
-                conn.readable = false;
-            },
-            .write_only => {
-                if (!conn.writable)
-                    return;
-                conn.writable = false;
-            },
-            .read_write => {
-                if (!conn.readable and
-                    !conn.writable)
-                    return;
-                conn.readable = false;
-                conn.writable = false;
-            },
+        self.remote_recv_once = false;
+        log.info("tunnel recv from remote", .{});
+        self.parent.io.recv(
+            *Context,
+            self.parent,
+            onRecvFromClient,
+            &self.recv_compl,
+            self.remote.socket,
+            &self.remote.buffer,
+        );
+    }
+
+    pub fn onRecvFromRemote(
+        ctx: *Context,
+        completion: *IO.Completion,
+        result: IO.RecvError!usize,
+    ) void {
+        _ = completion;
+        const ses = &ctx.tunnel;
+        const conn = ses.client;
+
+        conn.recv_len = result catch |err| {
+            log.err("{s}", .{@errorName(err)});
+            return;
+        };
+        log.info("{s}", .{conn.buffer[0..conn.recv_len]});
+
+        if (conn.recv_len == 0) {
+            ses.remote_recv_once = true;
+            ses.recvFromClient();
         }
+
+        ses.sendToClient();
+    }
+
+    pub fn sendToClient(
+        self: *Self,
+    ) void {
+        const len = self.remote.recv_len;
+        self.parent.io.send(
+            *Context,
+            self.parent,
+            onSendToClient,
+            &self.send_compl,
+            self.client.socket,
+            self.remote.buffer[0..len],
+        );
+    }
+
+    pub fn onSendToClient(
+        ctx: *Context,
+        completion: *IO.Completion,
+        result: IO.SendError!usize,
+    ) void {
+        _ = ctx;
+        _ = completion;
+        _ = result catch |err| {
+            log.err("{s}", .{@errorName(err)});
+            return;
+        };
     }
 
     pub fn deinit(self: *Self) void {
         self.client.deinit();
         self.remote.deinit();
-        self.client_buf.deinit(self.parent.gpa);
-        self.remote_buf.deinit(self.parent.gpa);
     }
 };
