@@ -27,7 +27,9 @@ pub fn init(opts: InitOptions) !Server {
     return Server{
         .allocator = opts.allocator,
         .thread_pool = opts.thread_pool,
-        .stream_server = net.StreamServer.init(.{}),
+        .stream_server = net.StreamServer.init(
+            .{ .reuse_address = true },
+        ),
     };
 }
 
