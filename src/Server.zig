@@ -8,8 +8,11 @@ const net = std.net;
 const meta = std.meta;
 const ThreadPool = @import("ThreadPool.zig");
 const WaitGroup = @import("WaitGroup.zig");
+const RingBuffer = std.RingBuffer;
 const windows = std.os.windows;
 const Server = @This();
+
+const buf_size = 1024;
 
 allocator: mem.Allocator,
 thread_pool: *ThreadPool = undefined,
@@ -21,12 +24,10 @@ const InitOptions = struct {
 };
 
 pub fn init(opts: InitOptions) !Server {
-    var stream_server = net.StreamServer.init(.{});
-
     return Server{
         .allocator = opts.allocator,
         .thread_pool = opts.thread_pool,
-        .stream_server = stream_server,
+        .stream_server = net.StreamServer.init(.{}),
     };
 }
 
@@ -40,18 +41,14 @@ pub fn startServe(self: *Server, listen_ip: []const u8, port: u16) !void {
     try self.stream_server.listen(listen_addr);
 
     while (true) {
-        var wg: WaitGroup = .{};
-        defer self.thread_pool.waitAndWork(&wg);
-
-        for (self.thread_pool.threads) |_| {
-            wg.start();
-            try self.thread_pool.spawn(worker, .{ self, &wg });
-        }
+        try self.thread_pool.spawn(worker, .{self});
     }
 }
 
-fn worker(self: *Server, wg: *WaitGroup) void {
-    defer wg.finish();
+fn worker(self: *Server) void {
+    //var buf: [1 << 22]u8 = undefined;
+    //var fba = std.heap.FixedBufferAllocator.init(&buf);
+    //const gpa = fba.allocator();
 
     var client = self.stream_server.accept() catch |err| {
         std.log.err("accept error: {s}", .{@errorName(err)});
@@ -59,23 +56,30 @@ fn worker(self: *Server, wg: *WaitGroup) void {
     };
     defer client.stream.close();
 
-    var metadata = handshakeHandler(client.stream) catch |err| {
+    var metadata = handshakeHandler(self.allocator, client.stream) catch |err| {
         log.scoped(.handshake).err("{s}", .{@errorName(err)});
         return;
     };
+    defer metadata.deinit(self.allocator);
     log.info("received socks cmd: {s}", .{@tagName(metadata.command)});
 
     switch (metadata.command) {
         .connect => {
-            var remote = connectHandler(
-                self.allocator,
-                client.stream,
-                metadata,
-            ) catch |err| {
+            var remote = connectHandler(&metadata) catch |err| {
                 log.scoped(.connect).err("{s}", .{@errorName(err)});
                 return;
             };
             defer remote.close();
+            errdefer {
+                var fail = [_]u8{ 5, 4, 0, 1, 0, 0, 0, 0, 0, 0 };
+                _ = client.stream.writer().write(&fail) catch unreachable;
+            }
+
+            var success = [_]u8{ 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
+            _ = client.stream.writer().write(&success) catch |err| {
+                log.scoped(.connect).err("{s}", .{@errorName(err)});
+                return;
+            };
 
             copyLoop(client.stream, remote) catch |err| {
                 log.scoped(.connect).err("{s}", .{@errorName(err)});
@@ -132,62 +136,25 @@ fn copyLoop(strm1: net.Stream, strm2: net.Stream) !void {
 /// +----+-----+-------+------+----------+----------+
 /// | 1  |  1  | X'00' |  1   | Variable |    2     |
 /// +----+-----+-------+------+----------+----------+
-fn connectHandler(
-    allocator: mem.Allocator,
-    stream: net.Stream,
-    metadata: MetaData,
-) !net.Stream {
-    var remote: net.Stream = undefined;
+fn connectHandler(metadata: *MetaData) !net.Stream {
+    while (!metadata.addrs.isEmpty()) {
+        const size = @sizeOf(net.Address);
+        var bytes: [size]u8 = undefined;
 
-    if (metadata.addrs.addr) |addr| {
-        remote = try connectToAddress(stream, addr);
+        inline for (0..size) |i| {
+            bytes[i] = metadata.addrs.read().?;
+        }
+
+        const addr = @bitCast(net.Address, bytes);
+        log.debug("{}", .{addr});
+        return net.tcpConnectToAddress(addr) catch |err| switch (err) {
+            error.ConnectionRefused => {
+                continue;
+            },
+            else => return err,
+        };
     }
-
-    if (metadata.addrs.name) |name| {
-        remote = try connectToDomain(
-            allocator,
-            stream,
-            name,
-            metadata.addrs.port.?,
-        );
-    }
-
-    return remote;
-}
-
-fn connectToAddress(
-    stream: net.Stream,
-    addr: net.Address,
-) !net.Stream {
-    var remote = try net.tcpConnectToAddress(addr);
-    errdefer {
-        var fail = [_]u8{ 5, 4, 0, 1, 0, 0, 0, 0, 0, 0 };
-        _ = stream.writer().write(&fail) catch unreachable;
-    }
-
-    var success = [_]u8{ 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
-    _ = try stream.writer().write(&success);
-
-    return remote;
-}
-
-fn connectToDomain(
-    gpa: mem.Allocator,
-    stream: net.Stream,
-    name: []const u8,
-    port: u16,
-) !net.Stream {
-    log.debug("name: {s}, port: {d}", .{ name, port });
-    var remote = try net.tcpConnectToHost(gpa, name, port);
-    errdefer {
-        var fail = [_]u8{ 5, 4, 0, 1, 0, 0, 0, 0, 0, 0 };
-        _ = stream.writer().write(&fail) catch unreachable;
-    }
-
-    var success = [_]u8{ 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
-    _ = try stream.writer().write(&success);
-
-    return remote;
+    return std.os.ConnectError.ConnectionRefused;
 }
 
 /// +----+----------+----------+  +----+--------+
@@ -195,7 +162,7 @@ fn connectToDomain(
 /// +----+----------+----------+  +----+--------+
 /// | 1  |    1     | 1 to 255 |  | 1  |   1    |
 /// +----+----------+----------+  +----+--------+
-fn handshakeHandler(stream: net.Stream) !MetaData {
+fn handshakeHandler(gpa: mem.Allocator, stream: net.Stream) !MetaData {
     var version = try stream.reader().readByte();
 
     if (version != 5) {
@@ -209,17 +176,14 @@ fn handshakeHandler(stream: net.Stream) !MetaData {
 
     _ = try stream.writer().write(&[_]u8{ 5, 0x0 });
 
-    var cmd_buf = try stream.reader().readBytesNoEof(3);
-
     log.info("handshake success, stream: {d}", .{stream.handle});
-    return MetaData{
-        .command = @intToEnum(Command, cmd_buf[1]),
-        .addrs = try readAddress(stream),
-    };
+    return try readMetaData(gpa, stream);
 }
 
-fn readAddress(stream: net.Stream) !AddressName {
+fn readMetaData(gpa: mem.Allocator, stream: net.Stream) !MetaData {
+    var cmd_buf = try stream.reader().readBytesNoEof(3);
     var addr_type = try stream.reader().readByte();
+    var metadata = try MetaData.init(gpa, @intToEnum(Command, cmd_buf[1]));
 
     switch (@intToEnum(AddressType, addr_type)) {
         .ipv4_addr => {
@@ -235,11 +199,10 @@ fn readAddress(stream: net.Stream) !AddressName {
             );
 
             var port = @as(u16, port_s[0]) << 8 | port_s[1];
-            return AddressName{
-                .addr = try net.Address.parseIp(addr, port),
-                .name = null,
-                .port = null,
-            };
+            var address = try net.Address.parseIp(addr, port);
+
+            try metadata.addrs.writeSlice(mem.asBytes(&address));
+            return metadata;
         },
         .domain_name => {
             var buf: [253]u8 = undefined;
@@ -250,11 +213,14 @@ fn readAddress(stream: net.Stream) !AddressName {
 
             std.debug.assert(read_n == len);
 
-            return AddressName{
-                .addr = null,
-                .name = buf[0..len],
-                .port = port,
-            };
+            const list = try net.getAddressList(gpa, buf[0..len], port);
+            defer list.deinit();
+
+            if (list.addrs.len == 0) return error.UnknownHostName;
+            for (list.addrs) |addr| {
+                try metadata.addrs.writeSlice(mem.asBytes(&addr));
+            }
+            return metadata;
         },
         .ipv6_addr => {
             var buf: [39]u8 = undefined;
@@ -289,11 +255,10 @@ fn readAddress(stream: net.Stream) !AddressName {
             );
 
             var port = @as(u16, port_s[0]) << 8 | port_s[1];
-            return AddressName{
-                .addr = try net.Address.parseIp(addr, port),
-                .name = null,
-                .port = null,
-            };
+            var address = try net.Address.parseIp(addr, port);
+
+            try metadata.addrs.writeSlice(mem.asBytes(&address));
+            return metadata;
         },
     }
 }
@@ -332,11 +297,23 @@ const Command = enum(u8) {
 
 const MetaData = struct {
     command: Command,
-    addrs: AddressName,
-};
+    addrs: RingBuffer,
+    port: u16,
 
-const AddressName = struct {
-    addr: ?net.Address,
-    name: ?[]const u8,
-    port: ?u16,
+    pub fn init(gpa: mem.Allocator, command: Command) !MetaData {
+        return MetaData{
+            .command = command,
+            .addrs = try RingBuffer.init(
+                gpa,
+                buf_size,
+            ),
+            .port = undefined,
+        };
+    }
+
+    pub fn deinit(self: *MetaData, gpa: mem.Allocator) void {
+        self.command = undefined;
+        self.port = undefined;
+        self.addrs.deinit(gpa);
+    }
 };
