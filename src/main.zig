@@ -1,31 +1,27 @@
 const std = @import("std");
-const os = std.os;
-const net = std.net;
 const IO = @import("io").IO;
-const builtin = @import("builtin");
+const default = @import("default.zig");
 const Server = @import("Server.zig");
 
 pub fn main() !void {
-    var buf: [1 << 22]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buf);
-    const allocator = fba.allocator();
+    var arena = std.heap.ArenaAllocator.init(
+        std.heap.page_allocator,
+    );
+    defer arena.deinit();
 
-    if (builtin.os.tag != .windows) {
-        const act = os.Sigaction{
-            .handler = .{ .handler = os.SIG.IGN },
-            .mask = os.empty_sigset,
-            .flags = 0,
-        };
-        try os.sigaction(os.SIG.PIPE, &act, null);
-    }
+    var allocator = arena.allocator();
+
+    const config = Server.Config{
+        .bind_host = default.bind_host,
+        .bind_port = default.bind_port,
+        .idle_timeout = default.idle_timeout,
+    };
 
     var io = try IO.init(32, 0);
     defer io.deinit();
 
-    var server = Server.init(allocator, io);
+    var server = Server.init(allocator, io, config);
     defer server.deinit();
 
-    try server.startServe(
-        .{ .addr = "127.0.0.1", .port = 1081 },
-    );
+    try server.run();
 }

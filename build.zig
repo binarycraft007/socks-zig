@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
@@ -24,19 +23,15 @@ pub fn build(b: *std.Build) void {
     const io_module = io_pkg.module("io");
 
     const exe = b.addExecutable(.{
-        .name = "socks-zig",
+        .name = "socks5-zig",
         // In this case the main source file is merely a path, however, in more
         // complicated build scripts, this could be a generated file.
         .root_source_file = .{ .path = "src/main.zig" },
         .target = target,
         .optimize = optimize,
     });
-    exe.addModule("io", io_module);
 
-    if (target.isWindows()) {
-        exe.linkLibC();
-        exe.linkSystemLibrary("ws2_32");
-    }
+    exe.addModule("io", io_module);
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
@@ -72,6 +67,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
     exe_tests.addModule("io", io_module);
 
     // Similar to creating the run step earlier, this exposes a `test` step to

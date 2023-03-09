@@ -1,10 +1,10 @@
 .{
-    .name = "socks-zig",
+    .name = "socks5-zig",
     .version = "0.0.1",
     .dependencies = .{
         .io = .{
-            .url = "https://github.com/binarycraft007/iouring-zig/archive/refs/tags/v0.0.3.tar.gz",
-            .hash = "1220e07aafe394a0dde20dd94a017bf3dfa1ef09a7a392a711ba07f828f8b4ba8412",
+            .url = "https://github.com/binarycraft007/iouring-zig/archive/refs/tags/v0.0.5.tar.gz",
+            .hash = "1220c1be196a454cfcc9d989f96c8966c12f42c148bc7acd0ad6b594c3fa04dfa788",
         },
     },
 }
