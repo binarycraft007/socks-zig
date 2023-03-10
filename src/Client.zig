@@ -65,7 +65,7 @@ parser: Socks5, // The SOCKS protocol parser.
 incoming: *Connection, // Connection with the SOCKS client.
 outgoing: *Connection, // Connection with upstream.
 
-pub fn init(server: *Server) Client {
+pub fn init(server: *Server) !Client {
     var timeout = server.config.idle_timeout;
     var client = Client{
         .state = .handshake,
@@ -98,7 +98,11 @@ pub fn init(server: *Server) Client {
             .recv_compl = undefined,
             .close_compl = undefined,
             .conn_compl = undefined,
-            .handle = server.remote_handle,
+            .handle = try server.io.open_socket(
+                os.AF.INET,
+                os.SOCK.STREAM,
+                os.IPPROTO.TCP,
+            ),
             .idle_timeout = timeout,
         },
     };
@@ -407,39 +411,20 @@ fn doProxyStart(self: *Client) SessState {
 }
 
 fn doProxy(self: *Client) SessState {
-    self.connCycle(self.incoming, self.outgoing);
-    self.connCycle(self.outgoing, self.incoming);
+    self.connCycle(self.incoming, self.outgoing) catch
+        return self.doKill();
+
+    self.connCycle(self.outgoing, self.incoming) catch
+        return self.doKill();
+
     return .proxy;
 }
 
-fn connCycle(
-    self: *Client,
-    a: *Connection,
-    b: *Connection,
-) void {
-    var alen = a.result catch |err| {
-        log.err("{s}", .{@errorName(err)});
-        self.state = .kill;
-        self.doNext();
-        return;
-    };
-    if (a == self.incoming)
-        log.info("a incoming {d}", .{alen});
-    if (a == self.outgoing)
-        log.info("a outgoing {d}", .{alen});
-    // TODO Stop Session when done
+fn connCycle(self: *Client, a: *Connection, b: *Connection) !void {
+    var alen = try a.result;
+    var blen = try b.result;
 
-    var blen = b.result catch |err| {
-        log.err("{s}", .{@errorName(err)});
-        self.state = .kill;
-        self.doNext();
-        return;
-    };
-    if (b == self.incoming)
-        log.info("b incoming {d}", .{blen});
-    if (b == self.outgoing)
-        log.info("b outgoing {d}", .{blen});
-    // TODO Stop Session when done
+    if (blen == 0 and alen == 0) return error.EndOfStream;
 
     if (a.wrstate == .done) a.wrstate = .stop;
 

@@ -73,7 +73,15 @@ pub fn run(self: *Server) !void {
     try os.listen(self.tcp_handle, 1);
 
     self.acceptConnection();
-    while (true) try self.io.tick();
+    var tick: usize = 0xdeadbeef;
+    while (true) : (tick +%= 1) {
+        if (tick % 61 == 0) {
+            const timeout_ns = tick % (10 * std.time.ns_per_ms);
+            try self.io.run_for_ns(@intCast(u63, timeout_ns));
+        } else {
+            try self.io.tick();
+        }
+    }
 }
 
 pub fn acceptConnection(self: *Server) void {
@@ -99,15 +107,9 @@ fn onAcceptConnection(
         return;
     };
 
-    self.remote_handle = self.io.open_socket(
-        os.AF.INET,
-        os.SOCK.STREAM,
-        os.IPPROTO.TCP,
-    ) catch |err| {
+    var client = Client.init(self) catch |err| {
         log.err("{s}", .{@errorName(err)});
         return;
     };
-
-    var client = Client.init(self);
     client.finish();
 }
