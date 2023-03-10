@@ -33,11 +33,7 @@ pub const SessState = enum {
     proxy_start, // Connected. Start piping data.
     proxy, // Connected. Pipe data back and forth.
     kill, // Tear down session.
-    almost_dead_0, // Waiting for finalizers to complete.
-    almost_dead_1, // Waiting for finalizers to complete.
-    almost_dead_2, // Waiting for finalizers to complete.
-    almost_dead_3, // Waiting for finalizers to complete.
-    almost_dead_4, // Waiting for finalizers to complete.
+    almost_dead,
     dead, // Dead. Safe to free now.
 };
 
@@ -53,10 +49,6 @@ pub const Connection = struct {
     handle: os.socket_t,
     address: net.Address,
     buffer: [1 << 14]u8,
-    send_compl: IO.Completion,
-    recv_compl: IO.Completion,
-    close_compl: IO.Completion,
-    conn_compl: IO.Completion,
 };
 
 state: SessState,
@@ -71,43 +63,26 @@ pub fn init(server: *Server) !Client {
         .state = .handshake,
         .server = server,
         .parser = Socks5.init(),
-        .incoming = &Connection{
-            .conn_err = undefined,
-            .rdstate = .stop,
-            .wrstate = .stop,
-            .result = 0,
-            .client = undefined,
-            .buffer = undefined,
-            .address = undefined,
-            .send_compl = undefined,
-            .recv_compl = undefined,
-            .close_compl = undefined,
-            .conn_compl = undefined,
-            .handle = server.client_handle,
-            .idle_timeout = timeout,
-        },
-        .outgoing = &Connection{
-            .conn_err = undefined,
-            .rdstate = .stop,
-            .wrstate = .stop,
-            .result = 0,
-            .client = undefined,
-            .buffer = undefined,
-            .address = undefined,
-            .send_compl = undefined,
-            .recv_compl = undefined,
-            .close_compl = undefined,
-            .conn_compl = undefined,
-            .handle = try server.io.open_socket(
-                os.AF.INET,
-                os.SOCK.STREAM,
-                os.IPPROTO.TCP,
-            ),
-            .idle_timeout = timeout,
-        },
+        .incoming = try server.conn_pool.create(),
+        .outgoing = try server.conn_pool.create(),
     };
 
+    client.incoming.rdstate = .stop;
+    client.incoming.wrstate = .stop;
+    client.incoming.result = 0;
+    client.incoming.handle = server.client_handle;
+    client.incoming.idle_timeout = timeout;
     client.incoming.client = &client;
+
+    client.outgoing.rdstate = .stop;
+    client.outgoing.wrstate = .stop;
+    client.outgoing.result = 0;
+    client.outgoing.handle = try server.io.open_socket(
+        os.AF.INET,
+        os.SOCK.STREAM,
+        os.IPPROTO.TCP,
+    );
+    client.outgoing.idle_timeout = timeout;
     client.outgoing.client = &client;
 
     return client;
@@ -115,11 +90,15 @@ pub fn init(server: *Server) !Client {
 
 pub fn deinit(self: *Client) void {
     self.incoming.handle = IO.INVALID_SOCKET;
+    self.server.conn_pool.destroy(self.incoming);
+
     self.outgoing.handle = IO.INVALID_SOCKET;
+    self.server.conn_pool.destroy(self.outgoing);
 }
 
 pub fn finish(self: *Client) void {
     log.info("start read incoming", .{});
+    log.info("client_handle {d}", .{self.incoming.handle});
     self.connRecv(self.incoming);
 }
 
@@ -132,7 +111,10 @@ fn connRecv(
         *Connection,
         conn,
         connRecvDone,
-        &conn.recv_compl,
+        self.server.compl_pool.create() catch |err| {
+            log.err("{s}", .{@errorName(err)});
+            return;
+        },
         conn.handle,
         &conn.buffer,
     );
@@ -143,7 +125,8 @@ fn connRecvDone(
     completion: *IO.Completion,
     result: IO.RecvError!usize,
 ) void {
-    _ = completion;
+    var server = conn.client.server;
+    server.compl_pool.destroy(completion);
     conn.rdstate = .done;
     conn.result = result;
     conn.client.doNext();
@@ -184,35 +167,13 @@ fn doNext(self: *Client) void {
             log.warn("killing session", .{});
             break :blk self.doKill();
         },
-        .almost_dead_0 => blk: {
-            // TODO
-            break :blk self.state;
-        },
-        .almost_dead_1 => blk: {
-            // TODO
-            break :blk self.state;
-        },
-        .almost_dead_2 => blk: {
-            // TODO
-            break :blk self.state;
-        },
-        .almost_dead_3 => blk: {
-            // TODO
-            break :blk self.state;
-        },
-        .almost_dead_4 => blk: {
-            // TODO
-            break :blk self.state;
+        .almost_dead => blk: {
+            break :blk .almost_dead;
         },
         .dead => blk: {
-            // TODO
-            break :blk self.state;
+            break :blk .dead;
         },
     };
-
-    if (self.state == .dead) {
-        self.deinit();
-    }
 }
 
 fn doHandshake(self: *Client) SessState {
@@ -502,7 +463,10 @@ fn connConnect(
         *Connection,
         conn,
         connConnectDone,
-        &conn.conn_compl,
+        self.server.compl_pool.create() catch |err| {
+            log.err("{s}", .{@errorName(err)});
+            return;
+        },
         conn.handle,
         conn.address,
     );
@@ -513,7 +477,8 @@ fn connConnectDone(
     completion: *IO.Completion,
     result: IO.ConnectError!void,
 ) void {
-    _ = completion;
+    var server = conn.client.server;
+    server.compl_pool.destroy(completion);
     conn.conn_err = result;
     conn.client.doNext();
 }
@@ -528,7 +493,10 @@ fn connSend(
         *Connection,
         conn,
         connSendDone,
-        &conn.send_compl,
+        self.server.compl_pool.create() catch |err| {
+            log.err("{s}", .{@errorName(err)});
+            return;
+        },
         conn.handle,
         bytes,
     );
@@ -539,23 +507,19 @@ fn connSendDone(
     completion: *IO.Completion,
     result: IO.SendError!usize,
 ) void {
-    _ = completion;
+    var server = conn.client.server;
+    server.compl_pool.destroy(completion);
     conn.wrstate = .done;
     conn.result = result;
     conn.client.doNext();
 }
 
 fn doKill(self: *Client) SessState {
-    if (self.state == .almost_dead_0)
-        return self.state;
+    self.connClose(self.incoming);
+    self.connClose(self.outgoing);
+    self.state = .almost_dead;
 
-    if (self.incoming.handle != IO.INVALID_SOCKET)
-        self.connClose(self.incoming);
-
-    if (self.outgoing.handle != IO.INVALID_SOCKET)
-        self.connClose(self.outgoing);
-
-    return .almost_dead_1;
+    return .dead;
 }
 
 fn connClose(
@@ -569,17 +533,24 @@ fn connClose(
         *Connection,
         conn,
         connCloseDone,
-        &conn.close_compl,
+        self.server.compl_pool.create() catch |err| {
+            log.err("{s}", .{@errorName(err)});
+            return;
+        },
         conn.handle,
     );
 }
 
 fn connCloseDone(
-    self: *Connection,
+    conn: *Connection,
     completion: *IO.Completion,
     result: IO.CloseError!void,
 ) void {
-    _ = completion;
+    var client = conn.client;
+    var server = client.server;
+
+    server.compl_pool.destroy(completion);
     result catch unreachable;
-    self.client.doNext();
+    defer server.conn_pool.destroy(conn);
+    log.info("close connection", .{});
 }

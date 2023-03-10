@@ -6,6 +6,7 @@ const net = std.net;
 const IO = @import("io").IO;
 const Client = @import("Client.zig");
 const ThreadPool = @import("ThreadPool.zig");
+const MemoryPool = std.heap.MemoryPool;
 
 pub const Config = struct {
     bind_host: []const u8,
@@ -15,11 +16,15 @@ pub const Config = struct {
 
 const Server = @This();
 
+const CompletionPool = MemoryPool(IO.Completion);
+const ConnectionPool = MemoryPool(Client.Connection);
+
 io: IO,
 config: Config,
 address: net.Address,
 tcp_handle: os.socket_t,
-accp_compl: IO.Completion,
+compl_pool: CompletionPool,
+conn_pool: ConnectionPool,
 allocator: mem.Allocator,
 thread_pool: ThreadPool,
 client_handle: os.socket_t,
@@ -32,9 +37,10 @@ pub fn init(gpa: mem.Allocator, io: IO, cfg: Config) Server {
         .allocator = gpa,
         .tcp_handle = undefined,
         .thread_pool = undefined,
-        .accp_compl = undefined,
         .client_handle = undefined,
         .remote_handle = undefined,
+        .conn_pool = ConnectionPool.init(gpa),
+        .compl_pool = CompletionPool.init(gpa),
         .config = cfg,
     };
 }
@@ -89,7 +95,10 @@ pub fn acceptConnection(self: *Server) void {
         *Server,
         self,
         onAcceptConnection,
-        &self.accp_compl,
+        self.compl_pool.create() catch |err| {
+            log.err("{s}", .{@errorName(err)});
+            return;
+        },
         self.tcp_handle,
     );
 }
@@ -99,8 +108,7 @@ fn onAcceptConnection(
     completion: *IO.Completion,
     result: IO.AcceptError!os.socket_t,
 ) void {
-    _ = completion;
-    self.acceptConnection();
+    self.compl_pool.destroy(completion);
 
     self.client_handle = result catch |err| {
         log.err("{s}", .{@errorName(err)});
@@ -112,4 +120,5 @@ fn onAcceptConnection(
         return;
     };
     client.finish();
+    self.acceptConnection();
 }
