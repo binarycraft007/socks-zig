@@ -56,37 +56,7 @@ server: *Server, // Backlink to owning server context.
 parser: Socks5, // The SOCKS protocol parser.
 incoming: *Connection, // Connection with the SOCKS client.
 outgoing: *Connection, // Connection with upstream.
-
-pub fn init(server: *Server) !Client {
-    var timeout = server.config.idle_timeout;
-    var client = Client{
-        .state = .handshake,
-        .server = server,
-        .parser = Socks5.init(),
-        .incoming = try server.conn_pool.create(),
-        .outgoing = try server.conn_pool.create(),
-    };
-
-    client.incoming.rdstate = .stop;
-    client.incoming.wrstate = .stop;
-    client.incoming.result = 0;
-    client.incoming.handle = server.client_handle;
-    client.incoming.idle_timeout = timeout;
-    client.incoming.client = &client;
-
-    client.outgoing.rdstate = .stop;
-    client.outgoing.wrstate = .stop;
-    client.outgoing.result = 0;
-    client.outgoing.handle = try server.io.open_socket(
-        os.AF.INET,
-        os.SOCK.STREAM,
-        os.IPPROTO.TCP,
-    );
-    client.outgoing.idle_timeout = timeout;
-    client.outgoing.client = &client;
-
-    return client;
-}
+active_conns: usize,
 
 pub fn deinit(self: *Client) void {
     self.incoming.handle = IO.INVALID_SOCKET;
@@ -135,7 +105,7 @@ fn connRecvDone(
 fn doNext(self: *Client) void {
     self.state = switch (self.state) {
         .handshake => blk: {
-            log.info("doHandshake", .{});
+            log.info("doHandshake {}", .{self.incoming.handle});
             break :blk self.doHandshake();
         },
         .handshake_auth => blk: {
@@ -143,11 +113,11 @@ fn doNext(self: *Client) void {
             break :blk self.doHandshakeAuth();
         },
         .req_start => blk: {
-            log.info("doReqStart", .{});
+            log.info("doReqStart {}", .{self.incoming.handle});
             break :blk self.doReqStart();
         },
         .req_parse => blk: {
-            log.info("doReqParse", .{});
+            log.info("doReqParse {}", .{self.incoming.handle});
             break :blk self.doReqParse();
         },
         .req_connect_start => blk: {
@@ -553,4 +523,10 @@ fn connCloseDone(
     result catch unreachable;
     defer server.conn_pool.destroy(conn);
     log.info("close connection", .{});
+    client.active_conns -= 1;
+
+    if (client.active_conns == 0) {
+        log.info("detroy client now", .{});
+        server.client_pool.destroy(client);
+    }
 }
