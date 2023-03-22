@@ -107,7 +107,7 @@ fn onAcceptConnection(
     completion: *IO.Completion,
     result: IO.AcceptError!os.socket_t,
 ) void {
-    self.compl_pool.destroy(completion);
+    defer self.compl_pool.destroy(completion);
     self.acceptConnection();
 
     var client_handle = result catch |err| {

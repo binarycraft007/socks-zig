@@ -95,8 +95,8 @@ fn connRecvDone(
     completion: *IO.Completion,
     result: IO.RecvError!usize,
 ) void {
-    var server = conn.client.server;
-    server.compl_pool.destroy(completion);
+    //var server = conn.client.server;
+    defer conn.client.server.compl_pool.destroy(completion);
     conn.rdstate = .done;
     conn.result = result;
     conn.client.doNext();
@@ -448,7 +448,7 @@ fn connConnectDone(
     result: IO.ConnectError!void,
 ) void {
     var server = conn.client.server;
-    server.compl_pool.destroy(completion);
+    defer server.compl_pool.destroy(completion);
     conn.conn_err = result;
     conn.client.doNext();
 }
@@ -478,7 +478,7 @@ fn connSendDone(
     result: IO.SendError!usize,
 ) void {
     var server = conn.client.server;
-    server.compl_pool.destroy(completion);
+    defer server.compl_pool.destroy(completion);
     conn.wrstate = .done;
     conn.result = result;
     conn.client.doNext();
@@ -519,8 +519,8 @@ fn connCloseDone(
     var client = conn.client;
     var server = client.server;
 
-    server.compl_pool.destroy(completion);
     result catch unreachable;
+    defer server.compl_pool.destroy(completion);
     defer server.conn_pool.destroy(conn);
     log.info("close connection", .{});
     client.active_conns -= 1;
